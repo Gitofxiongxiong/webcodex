@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebCodex Demo</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="workspace-shell">
+      <aside class="history-panel">
+        <div class="history-header">
+          <h2>历史记录</h2>
+        </div>
+        <div id="conversation-list" class="conversation-list"></div>
+        <p id="history-empty" class="history-empty">暂无对话</p>
+      </aside>
+
+      <main class="app-shell">
+        <header class="topbar">
+          <div class="brand">
+            <h1>WebCodex</h1>
+            <p id="run-status">gpt-5.4 · xhigh · fast</p>
+          </div>
+          <div class="runtime-controls" aria-label="运行设置">
+            <label class="control-field model-field">
+              <span>模型</span>
+              <input id="model" list="model-options" value="gpt-5.4" autocomplete="off" />
+              <datalist id="model-options">
+                <option value="gpt-5.4"></option>
+                <option value="gpt-5.3-codex"></option>
+                <option value="gpt-5.2"></option>
+              </datalist>
+            </label>
+            <label class="control-field">
+              <span>推理</span>
+              <select id="reasoning-effort">
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh" selected>xhigh</option>
+              </select>
+            </label>
+            <div class="control-field">
+              <span>速度</span>
+              <div class="segmented" role="radiogroup" aria-label="速度模式">
+                <label>
+                  <input type="radio" name="speed-mode" value="standard" />
+                  <span>普通</span>
+                </label>
+                <label>
+                  <input type="radio" name="speed-mode" value="fast" checked />
+                  <span>快速</span>
+                </label>
+              </div>
+            </div>
+          </div>
+          <button id="new-chat" class="ghost-button" type="button">新对话</button>
+        </header>
+
+        <section id="messages" class="messages" aria-live="polite"></section>
+
+        <form id="composer" class="composer">
+          <textarea id="message" rows="1" placeholder="给 WebCodex 一个任务">帮我检查工作区，并告诉我接下来要改哪里。</textarea>
+          <button id="run" type="submit">发送</button>
+        </form>
+      </main>
+    </div>
+
+    <script src="./main.js" type="module"></script>
+  </body>
+</html>
