@@ -1,8 +1,13 @@
 import asyncio
 import fnmatch
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import shutil
+import subprocess
 import sys
 import uuid
 from collections.abc import AsyncIterator
@@ -37,6 +42,7 @@ ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 SpeedMode = Literal["standard", "fast"]
 
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
+ACCOUNT_PATTERN = re.compile(r"^[A-Za-z0-9._@+-]{3,64}$")
 SERVICE_TIER_BY_SPEED_MODE = {
     "standard": "default",
     "fast": "priority",
@@ -91,20 +97,144 @@ def require_worker_token(
         raise HTTPException(status_code=401, detail="Invalid worker token")
 
 
+def get_current_user(
+    authorization: str | None = Header(default=None),
+    access_token: str | None = Query(default=None),
+) -> dict:
+    token_hash = auth_token_hash_from_request(authorization, access_token)
+    user = store.get_user_by_session(token_hash)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
+def auth_token_hash_from_request(authorization: str | None, access_token: str | None = None) -> str:
+    token = (access_token or "").strip()
+    if not token and authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer":
+            token = value.strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    return token_hash(token)
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def normalize_account(account: str) -> str:
+    normalized = account.strip().lower()
+    if not ACCOUNT_PATTERN.fullmatch(normalized):
+        raise HTTPException(
+            status_code=400,
+            detail="Account must be 3-64 characters and use letters, numbers, '.', '_', '@', '+' or '-'",
+        )
+    return normalized
+
+
+def password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    iterations = 120_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str | None) -> bool:
+    if not stored_hash:
+        return False
+    try:
+        algorithm, iterations, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        expected = bytes.fromhex(digest_hex)
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            int(iterations),
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def issue_session(user_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    store.create_auth_session(user_id=user_id, token_hash=token_hash(token))
+    return token
+
+
+def public_user(user: dict) -> dict:
+    return {
+        "id": user["id"],
+        "account": user.get("account"),
+        "name": user["name"],
+        "created_at": user["created_at"],
+    }
+
+
+def default_workspace_id(user_id: str) -> str:
+    return f"workspace_{user_id}"
+
+
+def ensure_user_workspace(user: dict) -> dict:
+    return store.ensure_workspace(
+        user_id=user["id"],
+        workspace_id=default_workspace_id(user["id"]),
+        name="Default Workspace",
+    )
+
+
+def require_workspace_owner(workspace_id: str, user: dict) -> dict:
+    workspace = store.get_workspace(workspace_id)
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    if workspace["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return workspace
+
+
+def require_conversation_owner(conversation_id: str, user: dict) -> dict:
+    conversation = store.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
+
+
+def require_run_owner(run_id: str, user: dict) -> tuple[dict, dict]:
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    conversation = require_conversation_owner(run["conversation_id"], user)
+    return run, conversation
+
+
+class AuthRequest(BaseModel):
+    account: str = Field(min_length=3, max_length=64)
+    password: str = Field(min_length=4, max_length=128)
+
+
+class RegisterRequest(AuthRequest):
+    name: str | None = Field(default=None, max_length=80)
+
+
 class CreateUserRequest(BaseModel):
     id: str = "demo-user"
     name: str | None = "Demo User"
 
 
 class CreateWorkspaceRequest(BaseModel):
-    id: str = "demo-workspace"
-    user_id: str = "demo-user"
-    name: str = "Demo Workspace"
+    id: str | None = None
+    user_id: str | None = None
+    name: str = "Default Workspace"
 
 
 class CreateConversationRequest(BaseModel):
-    user_id: str = "demo-user"
-    workspace_id: str = "demo-workspace"
+    user_id: str | None = None
+    workspace_id: str | None = None
     title: str | None = "Demo Conversation"
 
 
@@ -215,9 +345,54 @@ async def codex_relay_responses(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/api/auth/register")
+def register(body: RegisterRequest) -> dict:
+    account = normalize_account(body.account)
+    display_name = (body.name or account).strip() or account
+    if store.get_user_by_account(account):
+        raise HTTPException(status_code=400, detail="Account already exists")
+    try:
+        user = store.create_user_account(
+            account=account,
+            name=display_name,
+            password_hash=password_hash(body.password),
+        )
+        workspace = ensure_user_workspace(user)
+        token = issue_session(user["id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"token": token, "user": public_user(user), "workspace": workspace}
+
+
+@app.post("/api/auth/login")
+def login(body: AuthRequest) -> dict:
+    account = normalize_account(body.account)
+    user = store.get_user_by_account(account)
+    if not user or not verify_password(body.password, user.get("password_hash")):
+        raise HTTPException(status_code=401, detail="Invalid account or password")
+    try:
+        workspace = ensure_user_workspace(user)
+        token = issue_session(user["id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"token": token, "user": public_user(user), "workspace": workspace}
+
+
+@app.get("/api/auth/me")
+def auth_me(current_user: dict = Depends(get_current_user)) -> dict:
+    workspace = ensure_user_workspace(current_user)
+    return {"user": public_user(current_user), "workspace": workspace}
+
+
+@app.post("/api/auth/logout")
+def logout(authorization: str | None = Header(default=None)) -> dict:
+    store.delete_auth_session(auth_token_hash_from_request(authorization))
+    return {"ok": True}
+
+
 @app.post("/api/users")
 def upsert_user(body: CreateUserRequest) -> dict:
-    return store.upsert_user(user_id=body.id, name=body.name)
+    return public_user(store.upsert_user(user_id=body.id, name=body.name))
 
 
 @app.get("/api/users/{user_id}")
@@ -225,27 +400,30 @@ def get_user(user_id: str) -> dict:
     user = store.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
+    return public_user(user)
 
 
 @app.post("/api/workspaces")
-def create_workspace(body: CreateWorkspaceRequest) -> dict:
+def create_workspace(body: CreateWorkspaceRequest, current_user: dict = Depends(get_current_user)) -> dict:
+    workspace_id = body.id or default_workspace_id(current_user["id"])
     try:
-        return store.create_workspace(user_id=body.user_id, workspace_id=body.id, name=body.name)
+        return store.create_workspace(user_id=current_user["id"], workspace_id=workspace_id, name=body.name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/workspaces/{workspace_id}")
-def get_workspace(workspace_id: str) -> dict:
-    workspace = store.get_workspace(workspace_id)
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-    return workspace
+def get_workspace(workspace_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+    return require_workspace_owner(workspace_id, current_user)
 
 
 @app.get("/api/workspaces/{workspace_id}/files")
-def list_workspace_files(workspace_id: str, version_id: str | None = None) -> dict:
+def list_workspace_files(
+    workspace_id: str,
+    version_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
     try:
         return {"files": store.list_workspace_files(workspace_id=workspace_id, version_id=version_id)}
     except ValueError as exc:
@@ -253,7 +431,12 @@ def list_workspace_files(workspace_id: str, version_id: str | None = None) -> di
 
 
 @app.get("/api/workspaces/{workspace_id}/file-ops")
-def list_workspace_file_ops(workspace_id: str, version_id: str | None = None) -> dict:
+def list_workspace_file_ops(
+    workspace_id: str,
+    version_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
     try:
         return {"ops": store.list_file_ops(workspace_id=workspace_id, version_id=version_id)}
     except ValueError as exc:
@@ -281,7 +464,7 @@ def worker_read_workspace_file(
     _authorized: None = Depends(require_worker_token),
     object_store: AliyunObjectStore = Depends(require_object_store),
 ) -> dict:
-    return read_workspace_file(
+    return read_workspace_file_content(
         workspace_id=workspace_id,
         file_path=file_path,
         version_id=version_id,
@@ -297,7 +480,7 @@ def worker_write_workspace_file(
     _authorized: None = Depends(require_worker_token),
     object_store: AliyunObjectStore = Depends(require_object_store),
 ) -> dict:
-    return write_workspace_file(
+    return write_workspace_file_content(
         workspace_id=workspace_id,
         file_path=file_path,
         body=body,
@@ -373,7 +556,23 @@ def read_workspace_file(
     workspace_id: str,
     file_path: str,
     version_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
     object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
+    return read_workspace_file_content(
+        workspace_id=workspace_id,
+        file_path=file_path,
+        version_id=version_id,
+        object_store=object_store,
+    )
+
+
+def read_workspace_file_content(
+    workspace_id: str,
+    file_path: str,
+    version_id: str | None,
+    object_store: AliyunObjectStore,
 ) -> dict:
     path = normalize_workspace_path(file_path)
     try:
@@ -396,7 +595,23 @@ def write_workspace_file(
     workspace_id: str,
     file_path: str,
     body: WriteWorkspaceFileRequest,
+    current_user: dict = Depends(get_current_user),
     object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
+    return write_workspace_file_content(
+        workspace_id=workspace_id,
+        file_path=file_path,
+        body=body,
+        object_store=object_store,
+    )
+
+
+def write_workspace_file_content(
+    workspace_id: str,
+    file_path: str,
+    body: WriteWorkspaceFileRequest,
+    object_store: AliyunObjectStore,
 ) -> dict:
     path = normalize_workspace_path(file_path)
     if not store.get_workspace(workspace_id):
@@ -418,13 +633,19 @@ def write_workspace_file(
 
 
 @app.post("/api/conversations", response_model=CreateConversationResponse)
-def create_conversation(body: CreateConversationRequest) -> CreateConversationResponse:
+def create_conversation(
+    body: CreateConversationRequest,
+    current_user: dict = Depends(get_current_user),
+) -> CreateConversationResponse:
     conversation_id = f"conv_{uuid.uuid4().hex}"
+    workspace = ensure_user_workspace(current_user)
+    workspace_id = body.workspace_id or workspace["id"]
+    require_workspace_owner(workspace_id, current_user)
     try:
         store.create_conversation(
             conversation_id=conversation_id,
-            user_id=body.user_id,
-            workspace_id=body.workspace_id,
+            user_id=current_user["id"],
+            workspace_id=workspace_id,
             title=body.title,
         )
     except ValueError as exc:
@@ -434,13 +655,15 @@ def create_conversation(body: CreateConversationRequest) -> CreateConversationRe
 
 @app.get("/api/conversations")
 def list_conversations(
-    user_id: str | None = Query(default="demo-user"),
-    workspace_id: str | None = Query(default="demo-workspace"),
+    workspace_id: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
 ) -> dict:
+    if workspace_id:
+        require_workspace_owner(workspace_id, current_user)
     return {
         "conversations": store.list_conversations(
-            user_id=user_id,
+            user_id=current_user["id"],
             workspace_id=workspace_id,
             limit=limit,
         )
@@ -448,17 +671,21 @@ def list_conversations(
 
 
 @app.get("/api/conversations/{conversation_id}/messages")
-def list_conversation_messages(conversation_id: str) -> dict:
-    if not store.get_conversation(conversation_id):
-        raise HTTPException(status_code=404, detail="Conversation not found")
+def list_conversation_messages(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_conversation_owner(conversation_id, current_user)
     return {"messages": store.list_messages(conversation_id)}
 
 
 @app.post("/api/conversations/{conversation_id}/runs", response_model=CreateRunResponse)
-async def create_run(conversation_id: str, body: CreateRunRequest) -> CreateRunResponse:
-    conversation = store.get_conversation(conversation_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+async def create_run(
+    conversation_id: str,
+    body: CreateRunRequest,
+    current_user: dict = Depends(get_current_user),
+) -> CreateRunResponse:
+    conversation = require_conversation_owner(conversation_id, current_user)
     run_settings = resolve_run_settings(body, settings)
     run_id = f"run_{uuid.uuid4().hex}"
     previous_messages = store.list_messages(conversation_id)
@@ -497,10 +724,8 @@ async def create_run(conversation_id: str, body: CreateRunRequest) -> CreateRunR
 
 
 @app.get("/api/runs/{run_id}")
-def get_run(run_id: str) -> dict:
-    run = store.get_run(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+def get_run(run_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+    run, _conversation = require_run_owner(run_id, current_user)
     return run
 
 
@@ -509,9 +734,9 @@ async def stream_run_events(
     request: Request,
     run_id: str,
     after: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
 ) -> StreamingResponse:
-    if not store.get_run(run_id):
-        raise HTTPException(status_code=404, detail="Run not found")
+    require_run_owner(run_id, current_user)
     return StreamingResponse(
         event_stream(request, run_id=run_id, after=after),
         media_type="text/event-stream",
@@ -711,15 +936,8 @@ async def start_node_worker(
         env["OPENAI_BASE_URL"] = f"{settings.api_base_url.rstrip('/')}/codex-relay/v1"
         env["OPENAI_MODEL_PROVIDER"] = "codex-relay"
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "node",
-            str(worker_entry),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
+    node_executable = shutil.which("node")
+    if not node_executable:
         store.append_event(
             run_id,
             {
@@ -731,10 +949,25 @@ async def start_node_worker(
         store.set_run_status(run_id, "failed")
         return
 
-    stdout_task = asyncio.create_task(pipe_worker_log(run_id, process.stdout, "stdout"))
-    stderr_task = asyncio.create_task(pipe_worker_log(run_id, process.stderr, "stderr"))
-    code = await process.wait()
-    await asyncio.gather(stdout_task, stderr_task)
+    try:
+        code = await asyncio.to_thread(
+            run_worker_process,
+            run_id=run_id,
+            node_executable=node_executable,
+            worker_entry=worker_entry,
+            env=env,
+        )
+    except Exception as exc:
+        store.append_event(
+            run_id,
+            {
+                "type": "run.failed",
+                "visibility": "user",
+                "payload": {"error": f"Node worker failed to start: {exc}"},
+            },
+        )
+        store.set_run_status(run_id, "failed")
+        return
 
     if code != 0:
         store.append_event(
@@ -748,13 +981,30 @@ async def start_node_worker(
         store.set_run_status(run_id, "failed")
 
 
-async def pipe_worker_log(run_id: str, stream: asyncio.StreamReader | None, name: str) -> None:
-    if stream is None:
-        return
-    while line := await stream.readline():
-        text = line.decode(errors="replace").rstrip()
-        if text:
-            print(f"[worker:{run_id}:{name}] {text}", file=sys.stderr)
+def run_worker_process(
+    *,
+    run_id: str,
+    node_executable: str,
+    worker_entry,
+    env: dict[str, str],
+) -> int:
+    process = subprocess.Popen(
+        [node_executable, str(worker_entry)],
+        cwd=str(worker_entry.parent),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    stdout_text, stderr_text = process.communicate()
+    for name, text_block in (("stdout", stdout_text), ("stderr", stderr_text)):
+        for text in text_block.splitlines()[-80:]:
+            text = text.rstrip()
+            if text:
+                print(f"[worker:{run_id}:{name}] {text}", file=sys.stderr)
+    return process.returncode
 
 
 def iter_workspace_text_files(

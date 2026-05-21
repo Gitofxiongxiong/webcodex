@@ -24,6 +24,20 @@ webcodex/
 
 ## Run
 
+Fast start from the repo root:
+
+```powershell
+.\start.ps1
+```
+
+Useful options:
+
+```powershell
+.\start.ps1 -Restart      # stop existing listeners on 8000/5173 before starting
+.\start.ps1 -SkipInstall  # skip dependency checks
+.\start.ps1 -Open         # open the frontend after startup
+```
+
 One-time setup:
 
 ```powershell

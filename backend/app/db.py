@@ -32,8 +32,19 @@ class DemoStore:
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     id TEXT PRIMARY KEY,
+                    account TEXT,
                     name TEXT NOT NULL,
+                    password_hash TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    expires_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS workspaces (
@@ -138,6 +149,9 @@ class DemoStore:
                 CREATE INDEX IF NOT EXISTS idx_workspace_files_current
                     ON workspace_files(workspace_id, version_id, path);
 
+                CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
+                    ON auth_sessions(user_id, expires_at);
+
                 CREATE INDEX IF NOT EXISTS idx_file_ops_workspace_version
                     ON file_ops(workspace_id, version_id);
 
@@ -151,6 +165,21 @@ class DemoStore:
                     ON run_events(run_id, seq);
                 """
             )
+            self._migrate_user_auth_columns(conn)
+
+    def _migrate_user_auth_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "account" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN account TEXT")
+        if "password_hash" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_account
+                ON users(account)
+                WHERE account IS NOT NULL
+            """
+        )
 
     def upsert_user(self, user_id: str, name: str | None = None) -> dict[str, Any]:
         display_name = name or user_id
@@ -170,6 +199,66 @@ class DemoStore:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return dict(row) if row else None
+
+    def create_user_account(self, account: str, name: str, password_hash: str) -> dict[str, Any]:
+        user_id = f"user_{uuid.uuid4().hex}"
+        with self._lock, self.connect() as conn:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO users(id, account, name, password_hash)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (user_id, account, name, password_hash),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Account already exists") from exc
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row)
+
+    def get_user_by_account(self, account: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE account = ?", (account,)).fetchone()
+        return dict(row) if row else None
+
+    def create_auth_session(self, user_id: str, token_hash: str, ttl_days: int = 30) -> None:
+        with self._lock, self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+                raise ValueError("User not found")
+            conn.execute(
+                """
+                INSERT INTO auth_sessions(token_hash, user_id, expires_at)
+                VALUES (?, ?, datetime('now', ?))
+                """,
+                (token_hash, user_id, f"+{ttl_days} days"),
+            )
+
+    def get_user_by_session(self, token_hash: str) -> dict[str, Any] | None:
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT u.*
+                FROM auth_sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.token_hash = ? AND s.expires_at > datetime('now')
+                """,
+                (token_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                """
+                UPDATE auth_sessions
+                SET last_seen_at = datetime('now')
+                WHERE token_hash = ?
+                """,
+                (token_hash,),
+            )
+        return dict(row)
+
+    def delete_auth_session(self, token_hash: str) -> None:
+        with self._lock, self.connect() as conn:
+            conn.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
 
     def ensure_workspace(self, user_id: str, workspace_id: str, name: str | None = None) -> dict[str, Any]:
         with self._lock, self.connect() as conn:
