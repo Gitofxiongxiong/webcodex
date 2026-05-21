@@ -139,6 +139,36 @@ export class SdkEventNormalizer {
       ];
     }
 
+    if (data.type === "response.completed" && data.response?.usage) {
+      const response = data.response;
+      const usage = response.usage ?? {};
+      const inputDetails = usage.input_tokens_details ?? {};
+      const outputDetails = usage.output_tokens_details ?? {};
+      return [
+        event(
+          "model.usage",
+          {
+            callId: response.id,
+            model: response.model,
+            provider: process.env.OPENAI_MODEL_PROVIDER ?? null,
+            serviceTier: response.service_tier ?? null,
+            responseId: response.id,
+            source: "response.completed",
+            usage: {
+              inputTokens: numeric(usage.input_tokens),
+              cachedTokens: numeric(inputDetails.cached_tokens),
+              outputTokens: numeric(usage.output_tokens),
+              reasoningTokens: numeric(outputDetails.reasoning_tokens),
+              totalTokens: numeric(usage.total_tokens),
+              inputTokensDetails: inputDetails,
+              outputTokensDetails: outputDetails,
+            },
+          },
+          { itemId: itemIdFor(response.id, "model_usage"), status: "completed", visibility: "debug" }
+        ),
+      ];
+    }
+
     return [];
   }
 
@@ -321,4 +351,9 @@ function reasoningSummaryText(item) {
 
 function arrayOrEmpty(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function numeric(value) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
 }

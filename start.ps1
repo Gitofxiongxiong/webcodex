@@ -105,23 +105,27 @@ function Ensure-PythonEnvironment {
     }
 }
 
-function Ensure-NodeEnvironment {
-    Find-CommandPath "node" | Out-Null
+function Ensure-NodePackage {
+    param(
+        [string]$Name,
+        [string]$Directory
+    )
+
     $npm = Find-CommandPath "npm"
     if ($SkipInstall) {
         return
     }
 
-    $packageJson = Join-Path $WorkerDir "package.json"
-    $packageLock = Join-Path $WorkerDir "package-lock.json"
-    $nodeModules = Join-Path $WorkerDir "node_modules"
-    $marker = Join-Path $WorkerDir ".npm.sha256"
+    $packageJson = Join-Path $Directory "package.json"
+    $packageLock = Join-Path $Directory "package-lock.json"
+    $nodeModules = Join-Path $Directory "node_modules"
+    $marker = Join-Path $Directory ".npm.sha256"
     $stamp = Get-DependencyStamp @($packageJson, $packageLock)
     $current = if (Test-Path $marker) { Get-Content -Raw -LiteralPath $marker } else { "" }
 
     if ((-not (Test-Path $nodeModules)) -or $current -ne $stamp) {
-        Write-Step "Installing worker-node npm dependencies"
-        Push-Location $WorkerDir
+        Write-Step "Installing $Name npm dependencies"
+        Push-Location $Directory
         try {
             & $npm install
         } finally {
@@ -130,6 +134,12 @@ function Ensure-NodeEnvironment {
         $stamp = Get-DependencyStamp @($packageJson, $packageLock)
         Set-Content -LiteralPath $marker -Value $stamp -NoNewline -Encoding UTF8
     }
+}
+
+function Ensure-NodeEnvironment {
+    Find-CommandPath "node" | Out-Null
+    Ensure-NodePackage -Name "worker-node" -Directory $WorkerDir
+    Ensure-NodePackage -Name "frontend" -Directory $FrontendDir
 }
 
 function Start-Backend {
@@ -160,9 +170,10 @@ function Start-Frontend {
     $stdout = Join-Path $DataDir "frontend.start.out.log"
     $stderr = Join-Path $DataDir "frontend.start.err.log"
     Write-Step "Starting frontend on port $FrontendPort"
+    $npm = Find-CommandPath "npm"
     Start-Process `
-        -FilePath $VenvPython `
-        -ArgumentList @("-m", "http.server", "$FrontendPort", "--bind", "127.0.0.1") `
+        -FilePath $npm `
+        -ArgumentList @("run", "dev", "--", "--host", "127.0.0.1", "--port", "$FrontendPort") `
         -WorkingDirectory $FrontendDir `
         -RedirectStandardOutput $stdout `
         -RedirectStandardError $stderr `

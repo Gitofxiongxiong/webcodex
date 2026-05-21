@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     openai_reasoning_summary: str = "detailed"
     openai_text_verbosity: str = "low"
     openai_service_tier: str = "priority"
+    model_prices_usd_per_1m_json: str = ""
+    openrouter_models_url: str = "https://openrouter.ai/api/v1/models"
+    openrouter_pricing_cache_seconds: int = 3600
     codex_relay_enabled: bool = True
     codex_relay_api_key: str = "webcodex-local-token"
     codex_relay_auth_file: str = "../docs/auth.json"

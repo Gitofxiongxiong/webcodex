@@ -17,7 +17,7 @@ This demo separates metadata from file content:
 webcodex/
   backend/       FastAPI API, SQLite business store, SSE stream gateway
   worker-node/   OpenAI Agents SDK worker and event normalizer
-  frontend/      Minimal browser UI
+  frontend/      Vite + React + Tailwind browser UI
   data/          SQLite database location
   docs/          Product and architecture documents
 ```
@@ -49,6 +49,8 @@ python -m venv .venv
 pip install -r requirements.txt
 cd ..\worker-node
 npm install
+cd ..\frontend
+npm install
 ```
 
 Before starting the backend, choose one model credential path:
@@ -70,7 +72,7 @@ Terminal 2:
 
 ```powershell
 cd F:\code0923\webcodex\frontend
-python -m http.server 5173
+npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
 Open:

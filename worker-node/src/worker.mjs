@@ -1,9 +1,10 @@
-import { Agent, OpenAIProvider, Runner } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner, webSearchTool } from "@openai/agents";
 
 import { event, mustEnv, optionalEnv, postEvent, postEvents } from "./protocol.mjs";
 import { SdkEventNormalizer, toJsonSafe } from "./sdk-events.mjs";
 import { createModelProvider } from "./model-provider.mjs";
 import { BackendConversationSession } from "./session.mjs";
+import { AttachmentClient, createOpenAIUploadClient } from "./attachments.mjs";
 import { makeSandboxTools } from "./tools/sandbox.mjs";
 import { makeWorkspaceTools } from "./tools/workspace.mjs";
 
@@ -14,7 +15,6 @@ async function main() {
   const conversationId = mustEnv("CONVERSATION_ID");
   const workspaceId = mustEnv("WORKSPACE_ID");
   const sandboxDir = mustEnv("SANDBOX_DIR");
-  const userMessage = mustEnv("USER_MESSAGE");
   const apiBaseUrl = mustEnv("API_BASE_URL");
   const workerToken = mustEnv("WORKER_TOKEN");
   const model = optionalEnv("OPENAI_MODEL", "gpt-5.4");
@@ -28,6 +28,18 @@ async function main() {
   const debugModelRequests = optionalEnv("WORKER_DEBUG_MODEL_REQUESTS", "false") === "true";
   const session = new BackendConversationSession({ conversationId, apiBaseUrl, workerToken });
   const sessionItems = await session.getItems();
+  const attachmentClient = new AttachmentClient({
+    apiBaseUrl,
+    workerToken,
+    sandboxDir,
+    openaiClient: createOpenAIUploadClient(),
+  });
+  const runInputPayload = await attachmentClient.getRunInput(runId);
+  const runInput = await attachmentClient.buildRunInput({
+    runId,
+    input: runInputPayload.input,
+    attachments: runInputPayload.attachments,
+  });
 
   await postEvent(
     event("run.started", {
@@ -44,7 +56,8 @@ async function main() {
       speedMode,
       storeResponses,
       provider: providerLabel,
-      inputItemCount: 1,
+      inputItemCount: runInput.length,
+      attachmentCount: runInputPayload.attachments?.length ?? 0,
       sessionId: await session.getSessionId(),
       sessionItemCount: sessionItems.length,
     })
@@ -74,9 +87,10 @@ async function main() {
     traceIncludeSensitiveData: false,
   });
   const normalizer = new SdkEventNormalizer({ assistantItemId: ASSISTANT_ITEM_ID });
-  const stream = await runner.run(agent, userMessage, {
+  const stream = await runner.run(agent, runInput, {
     stream: true,
     session,
+    sessionInputCallback: (historyItems, newItems) => attachmentClient.sessionInputCallback(historyItems, newItems),
     maxTurns: positiveIntEnv("OPENAI_MAX_TURNS", 12),
     reasoningItemIdPolicy: "omit",
     callModelInputFilter: omitReasoningItemsFromReplay,
@@ -140,12 +154,20 @@ function createCodexAgent({
       "Use workspace_read when you only need to inspect a workspace file without importing it.",
       "Use workspace_export to publish a sandbox file back to the WebCodex workspace.",
       "Use workspace_write only for direct simple workspace create/modify requests.",
-      "Only claim access to the run sandbox and workspace tools. Do not claim direct host filesystem access.",
+      "Uploaded attachments are already copied into the sandbox at the paths listed in the user message and are also provided as model inputs when supported.",
+      "Use sandbox_python or sandbox_bash to inspect, parse, convert, or analyze uploaded files and images.",
+      "Use web_search for current public information from the web when freshness matters.",
+      "Use sandbox_curl or the curl shell tool when you need to fetch or inspect a specific URL or HTTP endpoint.",
+      "The curl shell tool only allows curl commands; use sandbox_bash for other local shell work.",
+      "Only claim access to the run sandbox, web_search, curl, and workspace tools. Do not claim direct host filesystem access.",
       "When you write or export a file, briefly mention the path and purpose.",
       `Current workspace id: ${workspaceId}.`,
       `Current sandbox directory: ${sandboxDir}.`,
     ].join("\n"),
     tools: [
+      webSearchTool({
+        searchContextSize: "medium",
+      }),
       ...makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspaceId }),
       ...makeWorkspaceTools({ apiBaseUrl, workerToken, workspaceId }),
     ],

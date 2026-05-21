@@ -8,5 +8,8 @@ local_oss/
 docs/auth.json
 docs/oss配置.txt
 worker-node/node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
 .env
 .DS_Store

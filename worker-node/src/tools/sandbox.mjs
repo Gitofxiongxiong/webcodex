@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-import { tool } from "@openai/agents";
+import { shellTool, tool } from "@openai/agents";
 import { z } from "zod";
 
 import { WorkspaceApiClient } from "./workspace.mjs";
@@ -11,6 +11,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_CHARS = 24_000;
 const MAX_READ_BYTES = 512_000;
+const MAX_CURL_BODY_CHARS = 128_000;
 
 export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspaceId }) {
   const sandbox = new Sandbox({ sandboxDir });
@@ -83,6 +84,37 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
       errorFunction: formatToolError,
       timeoutMs: MAX_TIMEOUT_MS + 5_000,
     }),
+    shellTool({
+      name: "curl",
+      shell: new CurlOnlyShell({ cwd: sandbox.root }),
+      needsApproval: false,
+    }),
+    tool({
+      name: "sandbox_curl",
+      description: "Fetch or inspect a URL with curl from the current run sandbox. Use this for HTTP APIs, exact URLs, headers, status codes, and response bodies.",
+      parameters: z.object({
+        url: z.url().refine((value) => isHttpUrl(value), "URL must use http or https"),
+        method: z.string().min(1).max(16).optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+        body: z.string().max(MAX_CURL_BODY_CHARS).optional(),
+        follow_redirects: z.boolean().optional(),
+        include_headers: z.boolean().optional(),
+        timeout_ms: z.number().int().min(1_000).max(MAX_TIMEOUT_MS).optional(),
+      }),
+      execute: async ({ url, method, headers, body, follow_redirects, include_headers, timeout_ms }) =>
+        runCurl({
+          url,
+          method,
+          headers,
+          body,
+          followRedirects: follow_redirects ?? true,
+          includeHeaders: include_headers ?? true,
+          cwd: sandbox.root,
+          timeoutMs: timeout_ms ?? DEFAULT_TIMEOUT_MS,
+        }),
+      errorFunction: formatToolError,
+      timeoutMs: MAX_TIMEOUT_MS + 5_000,
+    }),
     tool({
       name: "workspace_import",
       description: "Import a UTF-8 file from the current WebCodex workspace into the sandbox. This copies workspace content into a sandbox-relative path.",
@@ -136,6 +168,155 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
       timeoutMs: 30_000,
     }),
   ];
+}
+
+class CurlOnlyShell {
+  constructor({ cwd }) {
+    this.cwd = cwd;
+  }
+
+  async run(action) {
+    const timeoutMs = normalizeTimeoutMs(action?.timeoutMs);
+    const maxOutputLength = normalizeOutputLimit(action?.maxOutputLength);
+    const commands = Array.isArray(action?.commands) ? action.commands : [];
+    const output = [];
+    for (const command of commands) {
+      output.push(await runCurlShellCommand({ command, cwd: this.cwd, timeoutMs, maxOutputLength }));
+    }
+    return { output, maxOutputLength };
+  }
+}
+
+async function runCurlShellCommand({ command, cwd, timeoutMs, maxOutputLength }) {
+  let argv;
+  try {
+    argv = parseShellWords(command);
+    validateCurlCommand(argv);
+  } catch (error) {
+    return {
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      outcome: { type: "exit", exitCode: null },
+    };
+  }
+
+  const result = await runCommand({
+    command: "curl",
+    args: argv.slice(1),
+    cwd,
+    timeoutMs,
+    maxOutputChars: maxOutputLength,
+  });
+  return {
+    stdout: limitText(result.stdout, maxOutputLength),
+    stderr: limitText(result.stderr, maxOutputLength),
+    outcome: result.timed_out ? { type: "timeout" } : { type: "exit", exitCode: result.exit_code },
+  };
+}
+
+function runCurl({ url, method, headers, body, followRedirects, includeHeaders, cwd, timeoutMs }) {
+  const args = ["--silent", "--show-error", "--fail-with-body", "--max-time", String(Math.ceil(timeoutMs / 1000))];
+  if (followRedirects) {
+    args.push("--location");
+  }
+  if (includeHeaders) {
+    args.push("--include");
+  }
+  if (method) {
+    args.push("--request", method.toUpperCase());
+  }
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    args.push("--header", `${name}: ${value}`);
+  }
+  if (body !== undefined) {
+    args.push("--data-raw", body);
+  }
+  args.push(url);
+  return runCommand({
+    command: "curl",
+    args,
+    cwd,
+    timeoutMs,
+  });
+}
+
+function validateCurlCommand(argv) {
+  if (argv.length === 0) {
+    throw new Error("curl shell tool requires a curl command");
+  }
+  if (path.basename(argv[0]).toLowerCase() !== "curl") {
+    throw new Error("curl shell tool only allows commands that start with curl");
+  }
+  if (!argv.some((arg) => isHttpUrl(arg))) {
+    throw new Error("curl shell tool requires at least one http or https URL");
+  }
+}
+
+function parseShellWords(command) {
+  const input = String(command ?? "");
+  const words = [];
+  let current = "";
+  let quote = null;
+  let escaped = false;
+
+  for (const char of input) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (current) {
+        words.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaped) {
+    current += "\\";
+  }
+  if (quote) {
+    throw new Error("curl command has an unterminated quote");
+  }
+  if (current) {
+    words.push(current);
+  }
+  return words;
+}
+
+function normalizeTimeoutMs(value) {
+  const number = Number(value ?? DEFAULT_TIMEOUT_MS);
+  if (!Number.isInteger(number) || number < 1_000 || number > MAX_TIMEOUT_MS) {
+    return DEFAULT_TIMEOUT_MS;
+  }
+  return number;
+}
+
+function normalizeOutputLimit(value) {
+  const number = Number(value ?? MAX_OUTPUT_CHARS);
+  if (!Number.isInteger(number) || number < 1 || number > MAX_OUTPUT_CHARS) {
+    return MAX_OUTPUT_CHARS;
+  }
+  return number;
 }
 
 class Sandbox {
@@ -221,7 +402,7 @@ class Sandbox {
   }
 }
 
-function runCommand({ command, args, cwd, timeoutMs }) {
+function runCommand({ command, args, cwd, timeoutMs, maxOutputChars = MAX_OUTPUT_CHARS }) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     let stdout = "";
@@ -240,10 +421,10 @@ function runCommand({ command, args, cwd, timeoutMs }) {
     }, timeoutMs);
 
     child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk.toString());
+      stdout = appendLimited(stdout, chunk.toString(), maxOutputChars);
     });
     child.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk.toString());
+      stderr = appendLimited(stderr, chunk.toString(), maxOutputChars);
     });
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -255,7 +436,7 @@ function runCommand({ command, args, cwd, timeoutMs }) {
         timed_out: timedOut,
         duration_ms: Date.now() - startedAt,
         stdout,
-        stderr: appendLimited(stderr, error.message),
+        stderr: appendLimited(stderr, error.message, maxOutputChars),
       });
     });
     child.on("close", (code, signal) => {
@@ -275,12 +456,25 @@ function runCommand({ command, args, cwd, timeoutMs }) {
   });
 }
 
-function appendLimited(current, next) {
+function appendLimited(current, next, maxOutputChars = MAX_OUTPUT_CHARS) {
   const value = current + next;
-  if (value.length <= MAX_OUTPUT_CHARS) {
+  if (value.length <= maxOutputChars) {
     return value;
   }
-  return value.slice(0, MAX_OUTPUT_CHARS) + "\n[output truncated]";
+  return value.slice(0, maxOutputChars) + "\n[output truncated]";
+}
+
+function limitText(value, maxOutputChars) {
+  return appendLimited("", String(value ?? ""), maxOutputChars);
+}
+
+function isHttpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function normalizeSlash(value) {

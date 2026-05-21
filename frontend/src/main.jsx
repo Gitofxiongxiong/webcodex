@@ -1,6 +1,10 @@
-import React, { useEffect, useMemo, useRef, useState } from "./vendor/react.bundle.mjs";
-import { createRoot } from "./vendor/react-dom-client.bundle.mjs";
-import "./vendor/dotlottie-wc/dotlottie-wc.js";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import "@lottiefiles/dotlottie-wc";
+import "katex/dist/katex.min.css";
+import "streamdown/styles.css";
+import { MarkdownRenderer } from "./components/markdown/MarkdownRenderer.jsx";
+import "./styles/app.css";
 
 const apiBaseUrlStorageKey = "webcodex.apiBaseUrl";
 const apiBaseUrl = resolveApiBaseUrl();
@@ -65,15 +69,12 @@ function App() {
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
-  const [attachments, setAttachments] = useState([]);
-  const [dragActive, setDragActive] = useState(false);
   const sourceRef = useRef(null);
   const activeAssistantIdRef = useRef(null);
   const currentRunIdRef = useRef(null);
   const cancelRequestedRef = useRef(false);
   const messagesRef = useRef(null);
   const inputRef = useRef(null);
-  const fileInputRef = useRef(null);
   const token = auth?.token ?? "";
   const workspaceId = auth?.workspace?.id ?? "";
 
@@ -112,8 +113,6 @@ function App() {
       setWorkspaceLoading(false);
       setWorkspaceFilesLoading(false);
       setWorkspaceError("");
-      setAttachments([]);
-      setDragActive(false);
       setStatus("就绪");
     }
   }, [token]);
@@ -291,8 +290,6 @@ function App() {
     cancelRequestedRef.current = false;
     setConversationId(null);
     setMessages([]);
-    clearComposerAttachments();
-    setDragActive(false);
     setUsagePanel(null);
     setStatus("就绪");
     setView("chat");
@@ -315,13 +312,12 @@ function App() {
     return body.conversation_id;
   }
 
-  async function createRun(targetConversationId, message, attachmentIds = []) {
+  async function createRun(targetConversationId, message) {
     const response = await apiFetch(`/api/conversations/${targetConversationId}/runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         message,
-        attachment_ids: attachmentIds,
         model: settings.model,
         reasoning_effort: settings.reasoningEffort,
         speed_mode: settings.speedMode,
@@ -334,113 +330,34 @@ function App() {
     return body;
   }
 
-  async function uploadFiles(fileList) {
-    const files = Array.from(fileList ?? []).filter(Boolean);
-    if (!files.length || running) {
-      return;
-    }
-    const staged = files.map((file) => ({
-      localId: crypto.randomUUID(),
-      file,
-      name: file.name || "attachment",
-      size: file.size,
-      content_type: file.type || "application/octet-stream",
-      previewUrl: file.type?.startsWith("image/") ? URL.createObjectURL(file) : "",
-      status: "uploading",
-      error: "",
-    }));
-    setAttachments((items) => [...items, ...staged]);
-
-    const form = new FormData();
-    for (const file of files) {
-      form.append("files", file, file.name || "attachment");
-    }
-    const query = workspaceId ? `?workspace_id=${encodeURIComponent(workspaceId)}` : "";
-    try {
-      const response = await apiFetch(`/api/attachments${query}`, {
-        method: "POST",
-        body: form,
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        throw new Error(body.detail ?? "附件上传失败");
-      }
-      const uploaded = body.attachments ?? [];
-      setAttachments((items) => replaceUploadedAttachments(items, staged, uploaded));
-    } catch (error) {
-      setAttachments((items) => items.map((item) => (
-        staged.some((stagedItem) => stagedItem.localId === item.localId)
-          ? { ...item, status: "failed", error: error.message }
-          : item
-      )));
-    }
-  }
-
-  function removeAttachment(localId) {
-    setAttachments((items) => {
-      const target = items.find((item) => item.localId === localId);
-      if (target?.previewUrl) {
-        URL.revokeObjectURL(target.previewUrl);
-      }
-      return items.filter((item) => item.localId !== localId);
-    });
-  }
-
-  function handleDrop(event) {
-    event.preventDefault();
-    setDragActive(false);
-    if (running) {
-      return;
-    }
-    uploadFiles(event.dataTransfer?.files);
-  }
-
-  function handlePaste(event) {
-    const files = Array.from(event.clipboardData?.files ?? []);
-    if (files.length) {
-      uploadFiles(files);
-    }
-  }
-
   async function submitMessage(event) {
     event.preventDefault();
     const text = input.trim();
-    const readyAttachments = attachments.filter((item) => item.status === "uploaded" && item.id);
-    const busyAttachments = attachments.some((item) => item.status === "uploading");
-    const failedAttachments = attachments.some((item) => item.status === "failed");
-    if (running || busyAttachments || failedAttachments || (!text && readyAttachments.length === 0)) {
+    if (!text || running) {
       return;
     }
 
     const assistantId = crypto.randomUUID();
-    const messageAttachments = readyAttachments.map((item) => item.attachment);
     activeAssistantIdRef.current = assistantId;
     setMessages((items) => [
       ...items,
-      { id: crypto.randomUUID(), role: "user", content: text, attachments: messageAttachments },
+      { id: crypto.randomUUID(), role: "user", content: text },
       assistantMessage(assistantId, settings),
     ]);
     setInput("");
-    for (const item of readyAttachments) {
-      if (item.previewUrl) {
-        URL.revokeObjectURL(item.previewUrl);
-      }
-    }
-    setAttachments([]);
     setRunning(true);
     setUsagePanel(null);
     cancelRequestedRef.current = false;
     setStatus("排队中");
 
     try {
-      const targetConversationId = conversationId ?? (await createConversation(text || attachmentConversationTitle(messageAttachments)));
+      const targetConversationId = conversationId ?? (await createConversation(text));
       setConversationId(targetConversationId);
-      const run = await createRun(targetConversationId, text, readyAttachments.map((item) => item.id));
+      const run = await createRun(targetConversationId, text);
       setUsagePanel(initialUsagePanel(run.run_id, run.settings ?? settings));
       connectEvents(run.run_id);
       await refreshConversations(targetConversationId);
     } catch (error) {
-      setAttachments(readyAttachments);
       updateAssistant(assistantId, { content: displayErrorMessage(error, "运行失败"), failed: true, streaming: false });
       setRunning(false);
       setStatus("失败");
@@ -564,7 +481,6 @@ function App() {
     activeAssistantIdRef.current = null;
     currentRunIdRef.current = null;
     cancelRequestedRef.current = false;
-    clearComposerAttachments();
     setView("chat");
     setConversationId(targetConversationId);
     setMessages([]);
@@ -597,7 +513,6 @@ function App() {
     setView("chat");
     setConversationId(null);
     setMessages([]);
-    clearComposerAttachments();
     setUsagePanel(null);
     setStatus("就绪");
     inputRef.current?.focus();
@@ -608,18 +523,6 @@ function App() {
       return;
     }
     setMessages((items) => [...items, { id: crypto.randomUUID(), role: "notice", content: text }]);
-  }
-
-  function clearComposerAttachments() {
-    setAttachments((items) => {
-      for (const item of items) {
-        if (item.previewUrl) {
-          URL.revokeObjectURL(item.previewUrl);
-        }
-      }
-      return [];
-    });
-    setDragActive(false);
   }
 
   async function loadRunUsage(runId) {
@@ -696,34 +599,7 @@ function App() {
             )
           ),
           h("form", { key: "composer", className: `composer-wrap${hasMessages ? "" : " is-empty-chat"}`, onSubmit: submitMessage },
-            h("div", {
-              className: `composer${dragActive ? " is-dragging" : ""}`,
-              onDragEnter: (event) => {
-                event.preventDefault();
-                if (!running) {
-                  setDragActive(true);
-                }
-              },
-              onDragOver: (event) => event.preventDefault(),
-              onDragLeave: (event) => {
-                if (!event.currentTarget.contains(event.relatedTarget)) {
-                  setDragActive(false);
-                }
-              },
-              onDrop: handleDrop,
-            },
-              h("input", {
-                ref: fileInputRef,
-                className: "composer-file-input",
-                type: "file",
-                multiple: true,
-                disabled: running,
-                onChange: (event) => {
-                  uploadFiles(event.target.files);
-                  event.target.value = "";
-                },
-              }),
-              attachments.length ? h(AttachmentTray, { attachments, onRemove: removeAttachment }) : null,
+            h("div", { className: "composer" },
               h("textarea", {
                 ref: inputRef,
                 value: input,
@@ -731,7 +607,6 @@ function App() {
                 placeholder: "输入消息，按 Enter 发送",
                 disabled: running,
                 onChange: (event) => setInput(event.target.value),
-                onPaste: handlePaste,
                 onKeyDown: (event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
@@ -740,13 +615,7 @@ function App() {
                 },
               }),
               h("div", { className: "composer-footer" },
-                h("button", {
-                  className: "icon-button add-button",
-                  type: "button",
-                  disabled: running,
-                  title: "添加文件",
-                  onClick: () => fileInputRef.current?.click(),
-                }, h(Icon, { name: "paperclip" })),
+                h("button", { className: "icon-button add-button", type: "button", disabled: running, title: "添加上下文" }, "+"),
                 h(RuntimeControls, {
                   model,
                   reasoningEffort,
@@ -758,7 +627,7 @@ function App() {
                 h("button", {
                   className: `send-button${running ? " stop-button" : ""}`,
                   type: running ? "button" : "submit",
-                  disabled: running ? cancelRequestedRef.current : !canSubmit(input, attachments),
+                  disabled: running ? cancelRequestedRef.current : !input.trim(),
                   title: running ? "停止" : "发送",
                   onClick: running ? stopRun : undefined,
                 },
@@ -1118,7 +987,7 @@ function WorkspaceManager({
       ),
       h("div", { className: "workspace-manager-title" },
         h("h2", null, "用户工作空间"),
-        h("p", null, "当前文件夹能力来自 workspace 内文件路径，例如 src/main.js 会显示为 src 文件夹。空文件夹还没有独立持久化模型。")
+        h("p", null, "文件夹由 workspace 文件路径推导，例如 src/main.js 会显示为 src 文件夹；空文件夹目前没有独立持久化模型。")
       ),
       h("button", { className: "workspace-refresh-button", type: "button", disabled: loading, onClick: onRefresh, title: "刷新工作空间" },
         h(Icon, { name: "refresh" }),
@@ -1224,7 +1093,7 @@ function FileTree({ nodes, depth = 0 }) {
 function WcxLogo() {
   return h("img", {
     className: "brand-logo-image",
-    src: "./assets/wcx-logo-transparent.png",
+    src: "/assets/wcx-logo-transparent.png",
     alt: "WebCodex",
   });
 }
@@ -1319,17 +1188,6 @@ function Icon({ name, className = "" }) {
     return h("svg", common,
       h("path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" }),
       h("path", { d: "M14 2v6h6" })
-    );
-  }
-  if (name === "paperclip") {
-    return h("svg", common,
-      h("path", { d: "m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" })
-    );
-  }
-  if (name === "x") {
-    return h("svg", common,
-      h("path", { d: "M18 6 6 18" }),
-      h("path", { d: "m6 6 12 12" })
     );
   }
   if (name === "refresh") {
@@ -1607,7 +1465,7 @@ function EmptyBlinkingSquare() {
   return h("div", { className: "empty-blinking-square", role: "status", "aria-label": "等待输入" },
     h("dotlottie-wc", {
       className: "empty-blinking-lottie",
-      src: "./assets/Blinking%20Square.lottie",
+      src: "/assets/Blinking%20Square.lottie",
       autoplay: true,
       loop: true,
     })
@@ -1620,10 +1478,7 @@ function MessageView({ message }) {
   }
   if (message.role === "user") {
     return h("article", { className: "user-row" },
-      h("div", { className: "user-bubble" },
-        message.content ? h("div", { className: "user-text" }, message.content) : null,
-        message.attachments?.length ? h(MessageAttachments, { attachments: message.attachments }) : null
-      )
+      h("div", { className: "user-bubble" }, message.content)
     );
   }
   return h("article", { className: `assistant-row${message.failed ? " failed" : ""}${message.streaming ? " streaming" : ""}` },
@@ -1633,7 +1488,7 @@ function MessageView({ message }) {
     h("div", { className: "assistant-body" },
       h("div", { className: "assistant-blocks" },
         assistantBlocks(message).length
-          ? assistantBlocks(message).map((block) => h(AssistantBlock, { key: block.id, block }))
+          ? assistantBlocks(message).map((block) => h(AssistantBlock, { key: block.id, block, streaming: message.streaming }))
           : (message.failed ? "" : h("span", { className: "assistant-placeholder" })),
         message.cancelled ? h("div", { className: "assistant-stop-note" }, "已停止") : null
       )
@@ -1641,67 +1496,19 @@ function MessageView({ message }) {
   );
 }
 
-function AttachmentTray({ attachments, onRemove }) {
-  return h("div", { className: "attachment-tray" },
-    attachments.map((attachment) => h(AttachmentPreview, {
-      key: attachment.localId,
-      item: attachment,
-      onRemove: () => onRemove(attachment.localId),
-    }))
-  );
-}
-
-function AttachmentPreview({ item, onRemove }) {
-  const attachment = item.attachment ?? {};
-  const name = attachment.filename || item.name;
-  const contentType = attachment.content_type || item.content_type;
-  const previewUrl = item.previewUrl || attachmentPreviewUrl(attachment);
-  const image = isImageAttachment({ content_type: contentType }) && previewUrl;
-  return h("div", { className: `attachment-preview ${item.status}` },
-    image ? h("img", { src: previewUrl, alt: name }) : h("div", { className: "attachment-file-icon" }, h(Icon, { name: "file" })),
-    h("div", { className: "attachment-preview-main" },
-      h("span", { className: "attachment-name", title: name }, name),
-      h("span", { className: "attachment-meta" },
-        item.status === "uploading" ? "上传中" : item.status === "failed" ? item.error || "上传失败" : `${formatBytes(attachment.size ?? item.size)} · ${contentType || "file"}`
-      )
-    ),
-    h("button", { className: "attachment-remove", type: "button", title: "移除", onClick: onRemove },
-      h(Icon, { name: "x" })
-    )
-  );
-}
-
-function MessageAttachments({ attachments }) {
-  return h("div", { className: "message-attachments" },
-    attachments.map((attachment) => h("a", {
-      key: attachment.id ?? attachment.workspace_path,
-      className: `message-attachment ${isImageAttachment(attachment) ? "image" : "file"}`,
-      href: attachment.id ? `${apiBaseUrl}/api/attachments/${encodeURIComponent(attachment.id)}/content?access_token=${encodeURIComponent(readStoredAuth()?.token ?? "")}` : undefined,
-      target: "_blank",
-      rel: "noreferrer",
-    },
-      isImageAttachment(attachment)
-        ? h("img", { src: attachmentPreviewUrl(attachment), alt: attachment.filename || attachment.safe_name || "image" })
-        : h(Icon, { name: "file" }),
-      h("span", null, attachment.filename || attachment.safe_name || attachment.workspace_path),
-      h("small", null, formatBytes(attachment.size))
-    ))
-  );
-}
-
-function AssistantBlock({ block }) {
+function AssistantBlock({ block, streaming = false }) {
   if (block.type === "reasoning") {
     return h(ReasoningDisclosure, { block });
   }
   if (block.type === "tool") {
     return h(ToolDisclosure, { block });
   }
-  return h(AssistantTextBlock, { block });
+  return h(AssistantTextBlock, { block, streaming });
 }
 
-function AssistantTextBlock({ block }) {
+function AssistantTextBlock({ block, streaming = false }) {
   return h("div", { className: "assistant-text assistant-text-block" },
-    block.text ? h(MarkdownView, { content: block.text }) : null
+    block.text ? h(MarkdownView, { content: block.text, streaming: streaming && block.status !== "completed" }) : null
   );
 }
 
@@ -1740,18 +1547,15 @@ function ToolDisclosure({ block }) {
   );
 }
 
-function MarkdownView({ content }) {
-  return h("div", {
-    className: "markdown-body",
-    dangerouslySetInnerHTML: { __html: renderMarkdown(content) },
-  });
+function MarkdownView({ content, streaming = false }) {
+  return h(MarkdownRenderer, { content, streaming });
 }
 
 function ThinkingIndicator({ className = "" } = {}) {
   return h("div", { className: `thinking-indicator ${className}`.trim(), role: "status", "aria-label": "正在思考" },
     h("dotlottie-wc", {
       className: "thinking-lottie",
-      src: "./assets/thinking-blue.lottie",
+      src: "/assets/thinking-blue.lottie",
       autoplay: true,
       loop: true,
     })
@@ -1795,64 +1599,8 @@ function storedMessage(message) {
   return {
     id: message.id ?? crypto.randomUUID(),
     role: "user",
-    content: message.payload?.text ?? message.content,
-    attachments: message.attachments ?? message.payload?.attachments ?? [],
+    content: message.content,
   };
-}
-
-function replaceUploadedAttachments(items, staged, uploaded) {
-  let uploadIndex = 0;
-  const stagedIds = new Set(staged.map((item) => item.localId));
-  return items.map((item) => {
-    if (!stagedIds.has(item.localId)) {
-      return item;
-    }
-    const attachment = uploaded[uploadIndex++];
-    if (!attachment) {
-      return { ...item, status: "failed", error: "附件上传响应缺失" };
-    }
-    return {
-      ...item,
-      id: attachment.id,
-      attachment,
-      name: attachment.filename,
-      size: attachment.size,
-      content_type: attachment.content_type,
-      status: "uploaded",
-      error: "",
-    };
-  });
-}
-
-function canSubmit(input, attachments) {
-  const hasText = Boolean(input.trim());
-  const hasReadyAttachment = attachments.some((item) => item.status === "uploaded" && item.id);
-  const blocked = attachments.some((item) => item.status === "uploading" || item.status === "failed");
-  return !blocked && (hasText || hasReadyAttachment);
-}
-
-function isImageAttachment(attachment = {}) {
-  return String(attachment.content_type ?? "").startsWith("image/");
-}
-
-function attachmentPreviewUrl(attachment = {}) {
-  if (!attachment.id) {
-    return "";
-  }
-  const auth = readStoredAuth();
-  const token = auth?.token ?? "";
-  const query = token ? `?access_token=${encodeURIComponent(token)}` : "";
-  return `${apiBaseUrl}/api/attachments/${encodeURIComponent(attachment.id)}/content${query}`;
-}
-
-function attachmentConversationTitle(attachments = []) {
-  if (!attachments.length) {
-    return "附件对话";
-  }
-  if (attachments.length === 1) {
-    return attachments[0]?.filename || attachments[0]?.safe_name || "附件对话";
-  }
-  return `${attachments.length} 个附件`;
 }
 
 function isHiddenNotice(text) {
@@ -1862,188 +1610,6 @@ function isHiddenNotice(text) {
 function displayErrorMessage(error, fallback) {
   const text = String(error?.message ?? error ?? "").trim();
   return !text || isHiddenNotice(text) ? fallback : text;
-}
-
-function renderMarkdown(source) {
-  const blocks = extractMathAndCode(String(source ?? ""));
-  const escaped = escapeHtml(blocks.text).replace(/\r\n?/g, "\n");
-  return restoreMathAndCode(renderMarkdownBlocks(escaped, blocks.tokens), blocks.tokens);
-}
-
-function extractMathAndCode(source) {
-  const tokens = [];
-  const addToken = (html, block = false) => {
-    const token = `@@TOKEN_${tokens.length}@@`;
-    tokens.push({ html, block });
-    return token;
-  };
-  let text = source.replace(/```(\w+)?\n?([\s\S]*?)```/g, (_match, language, code) => {
-    return addToken(
-      `<pre><code${language ? ` class="language-${escapeAttribute(language)}"` : ""}>${escapeHtml(code.trim())}</code></pre>`,
-      true
-    );
-  });
-  text = text.replace(/`([^`\n]+)`/g, (_match, code) => {
-    return addToken(`<code>${escapeHtml(code)}</code>`);
-  });
-  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (_match, expr) => {
-    return addToken(renderKatex(expr, true), true);
-  });
-  text = text.replace(/\$([^$\n]+?)\$/g, (_match, expr) => {
-    return addToken(renderKatex(expr, false));
-  });
-  return { text, tokens };
-}
-
-function restoreMathAndCode(text, tokens) {
-  return tokens.reduce((current, token, index) => current.replaceAll(`@@TOKEN_${index}@@`, token.html), text);
-}
-
-function renderKatex(expr, displayMode) {
-  const raw = String(expr ?? "").trim();
-  const katex = window.katex;
-  if (!katex?.renderToString) {
-    return displayMode ? `<div class="math-fallback">$$${escapeHtml(raw)}$$</div>` : `<span class="math-fallback">$${escapeHtml(raw)}$</span>`;
-  }
-  try {
-    return katex.renderToString(raw, { displayMode, throwOnError: false, strict: "ignore" });
-  } catch {
-    return displayMode ? `<div class="math-fallback">$$${escapeHtml(raw)}$$</div>` : `<span class="math-fallback">$${escapeHtml(raw)}$</span>`;
-  }
-}
-
-function renderMarkdownBlocks(text, tokens) {
-  const lines = text.split("\n");
-  const html = [];
-  let index = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    if (isBlockTokenLine(line, tokens)) {
-      html.push(line.trim());
-      index += 1;
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      const level = heading[1].length;
-      html.push(`<h${level}>${renderInline(heading[2])}</h${level}>`);
-      index += 1;
-      continue;
-    }
-
-    if (isTableStart(lines, index)) {
-      const tableLines = [lines[index], lines[index + 1]];
-      index += 2;
-      while (index < lines.length && lines[index].trim() && lines[index].includes("|")) {
-        tableLines.push(lines[index]);
-        index += 1;
-      }
-      html.push(renderTableBlock(tableLines));
-      continue;
-    }
-
-    if (/^&gt;\s?/.test(line)) {
-      const quoteLines = [];
-      while (index < lines.length && /^&gt;\s?/.test(lines[index])) {
-        quoteLines.push(lines[index].replace(/^&gt;\s?/, ""));
-        index += 1;
-      }
-      html.push(`<blockquote>${quoteLines.map(renderInline).join("<br>")}</blockquote>`);
-      continue;
-    }
-
-    if (/^\s*[-*]\s+/.test(line) || /^\s*\d+\.\s+/.test(line)) {
-      const ordered = /^\s*\d+\.\s+/.test(line);
-      const pattern = ordered ? /^\s*\d+\.\s+/ : /^\s*[-*]\s+/;
-      const items = [];
-      while (index < lines.length && pattern.test(lines[index])) {
-        items.push(lines[index].replace(pattern, ""));
-        index += 1;
-      }
-      html.push(renderListBlock(items, ordered));
-      continue;
-    }
-
-    const paragraphLines = [];
-    while (index < lines.length && lines[index].trim() && !startsMarkdownBlock(lines, index, tokens)) {
-      paragraphLines.push(lines[index]);
-      index += 1;
-    }
-    html.push(`<p>${renderInline(paragraphLines.join("\n")).replace(/\n/g, "<br>")}</p>`);
-  }
-
-  return html.join("\n");
-}
-
-function startsMarkdownBlock(lines, index, tokens) {
-  const line = lines[index] ?? "";
-  return isBlockTokenLine(line, tokens)
-    || /^(#{1,6})\s+/.test(line)
-    || /^&gt;\s?/.test(line)
-    || /^\s*[-*]\s+/.test(line)
-    || /^\s*\d+\.\s+/.test(line)
-    || isTableStart(lines, index);
-}
-
-function isBlockTokenLine(line, tokens) {
-  const tokenIndex = tokenIndexFromLine(line);
-  return tokenIndex >= 0 && Boolean(tokens[tokenIndex]?.block);
-}
-
-function tokenIndexFromLine(line) {
-  const match = line.trim().match(/^@@TOKEN_(\d+)@@$/);
-  return match ? Number(match[1]) : -1;
-}
-
-function isTableStart(lines, index) {
-  const current = lines[index] ?? "";
-  const divider = lines[index + 1] ?? "";
-  return current.includes("|")
-    && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(divider);
-}
-
-function renderTableBlock(lines) {
-  const headers = splitTableRow(lines[0]).map(renderInline);
-  const rows = lines.slice(2).map((row) => splitTableRow(row).map(renderInline));
-  const thead = `<thead><tr>${headers.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead>`;
-  const tbody = `<tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`).join("")}</tbody>`;
-  return `<table>${thead}${tbody}</table>`;
-}
-
-function renderListBlock(items, ordered) {
-  const tag = ordered ? "ol" : "ul";
-  return `<${tag}>${items.map((item) => `<li>${renderInline(item)}</li>`).join("")}</${tag}>`;
-}
-
-function renderInline(text) {
-  return String(text ?? "")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_match, label, href) => (
-      `<a href="${escapeAttribute(href)}" target="_blank" rel="noreferrer">${label}</a>`
-    ))
-    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*(?!\s)([^*\n]+?)\*/g, "$1<em>$2</em>");
-}
-
-function splitTableRow(row) {
-  return row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function escapeAttribute(value) {
-  return escapeHtml(value).replace(/"/g, "&quot;");
 }
 
 function eventSettings(payload = {}, fallback) {
@@ -2337,8 +1903,6 @@ function buildFileTree(files) {
       if (isFile) {
         node.type = "file";
         node.size = numeric(file.size);
-        node.updated_at = file.updated_at;
-        node.content_type = file.content_type;
       }
       children = node.children;
     });

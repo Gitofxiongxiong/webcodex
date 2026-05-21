@@ -1,23 +1,29 @@
 import asyncio
+import base64
 import fnmatch
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+import httpx
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .codex_relay import CodexCredentialError, CodexCredentialStore, CodexRelay
@@ -42,11 +48,22 @@ ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 SpeedMode = Literal["standard", "fast"]
 
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
+SUPPORTED_MODELS = {"gpt-5.4", "gpt-5.5"}
 ACCOUNT_PATTERN = re.compile(r"^[A-Za-z0-9._@+-]{3,64}$")
 SERVICE_TIER_BY_SPEED_MODE = {
     "standard": "default",
     "fast": "priority",
 }
+DEFAULT_CONTEXT_WINDOW = 128000
+DEFAULT_RESERVED_OUTPUT_TOKENS = 8192
+OPENROUTER_PROVIDER_PREFIX = "openai/"
+_openrouter_price_cache: tuple[float, dict[str, dict[str, float]]] | None = None
+TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+MAX_ATTACHMENTS_PER_MESSAGE = 20
+IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+run_processes: dict[str, subprocess.Popen] = {}
+run_processes_lock = threading.RLock()
 
 
 @lru_cache
@@ -174,6 +191,211 @@ def public_user(user: dict) -> dict:
     }
 
 
+def model_catalog_payload(app_settings: Settings) -> dict:
+    return {
+        "models": sorted(SUPPORTED_MODELS),
+        "contextWindow": DEFAULT_CONTEXT_WINDOW,
+        "reservedOutputTokens": DEFAULT_RESERVED_OUTPUT_TOKENS,
+        "pricing": {
+            "source": "openrouter",
+            "basis": "per_token",
+            "usdPrices": openrouter_price_catalog(app_settings),
+            "overrideUsdPricesPer1M": configured_usd_price_catalog(app_settings),
+            "url": app_settings.openrouter_models_url,
+        },
+    }
+
+
+def configured_usd_price_catalog(app_settings: Settings) -> dict[str, dict[str, float]]:
+    return supported_price_catalog(normalize_price_catalog(load_json_object(app_settings.model_prices_usd_per_1m_json)))
+
+
+def supported_price_catalog(catalog: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    return {model: rates for model, rates in catalog.items() if model in SUPPORTED_MODELS}
+
+
+def openrouter_price_catalog(app_settings: Settings) -> dict[str, dict[str, float]]:
+    global _openrouter_price_cache
+    now = time.monotonic()
+    ttl = max(app_settings.openrouter_pricing_cache_seconds, 60)
+    if _openrouter_price_cache and now - _openrouter_price_cache[0] < ttl:
+        return _openrouter_price_cache[1]
+
+    catalog: dict[str, dict[str, float]] = {}
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.get(app_settings.openrouter_models_url)
+            response.raise_for_status()
+            models = response.json().get("data", [])
+    except Exception as exc:
+        print(f"[pricing] failed to fetch OpenRouter model prices: {exc}", file=sys.stderr)
+        if _openrouter_price_cache:
+            return _openrouter_price_cache[1]
+        return {}
+
+    for item in models if isinstance(models, list) else []:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "")
+        if not model_id.startswith(OPENROUTER_PROVIDER_PREFIX):
+            continue
+        model = normalize_model_key(model_id.removeprefix(OPENROUTER_PROVIDER_PREFIX))
+        if model not in SUPPORTED_MODELS:
+            continue
+        pricing = item.get("pricing") if isinstance(item.get("pricing"), dict) else {}
+        rates = {
+            "input": numeric_or_zero_float(pricing.get("prompt")),
+            "cached": numeric_or_zero_float(pricing.get("input_cache_read") or pricing.get("prompt")),
+            "output": numeric_or_zero_float(pricing.get("completion")),
+        }
+        if rates["input"] > 0 or rates["output"] > 0:
+            catalog[model] = {
+                **rates,
+                "contextWindow": numeric_or_zero_float(item.get("context_length")),
+            }
+
+    _openrouter_price_cache = (now, catalog)
+    return catalog
+
+
+def load_json_object(raw: str) -> dict:
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def normalize_price_catalog(raw: dict) -> dict[str, dict[str, float]]:
+    catalog: dict[str, dict[str, float]] = {}
+    for model_name, rates in raw.items():
+        if not isinstance(model_name, str) or not isinstance(rates, dict):
+            continue
+        normalized_rates = {}
+        for key in ("input", "cached", "output"):
+            number = numeric_or_none(rates.get(key))
+            if number is not None:
+                normalized_rates[key] = number
+        if normalized_rates:
+            catalog[normalize_model_key(model_name)] = normalized_rates
+    return catalog
+
+
+def enrich_usage_payload(payload: dict, app_settings: Settings) -> dict:
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    model = str(payload.get("model") or "").strip()
+    input_tokens = numeric_or_zero(usage.get("inputTokens") or usage.get("input_tokens"))
+    cached_tokens = numeric_or_zero(usage.get("cachedTokens") or usage.get("cached_tokens"))
+    output_tokens = numeric_or_zero(usage.get("outputTokens") or usage.get("output_tokens"))
+    billable_input_tokens = max(input_tokens - cached_tokens, 0)
+
+    enriched = dict(payload)
+    usd_pricing = price_for_model(configured_usd_price_catalog(app_settings), model)
+    price_source = "MODEL_PRICES_USD_PER_1M_JSON"
+    price_basis = "per_1m_tokens"
+    if not usd_pricing:
+        usd_pricing = price_for_model(openrouter_price_catalog(app_settings), model)
+        price_source = "openrouter"
+        price_basis = "per_token"
+    if usd_pricing:
+        enriched["costMicroUsd"] = calculate_micro_cost(
+            billable_input_tokens=billable_input_tokens,
+            cached_tokens=cached_tokens,
+            output_tokens=output_tokens,
+            rates=usd_pricing,
+            basis=price_basis,
+        )
+        enriched["pricing"] = {
+            **(enriched.get("pricing") if isinstance(enriched.get("pricing"), dict) else {}),
+            "unit": "usd",
+            "basis": price_basis,
+            "rates": usd_pricing,
+            "source": price_source,
+            "billableInputTokens": billable_input_tokens,
+        }
+    return enriched
+
+
+def usage_payload_with_context(payload: dict, context: dict | None) -> dict:
+    if not context:
+        return payload
+    enriched = dict(payload)
+    for key in (
+        "contextWindow",
+        "reservedOutputTokens",
+        "usableContextTokens",
+        "model",
+        "serviceTier",
+    ):
+        if enriched.get(key) is None and context.get(key) is not None:
+            enriched[key] = context[key]
+    if not enriched.get("breakdown") and context.get("breakdown"):
+        enriched["breakdown"] = context["breakdown"]
+
+    usage = enriched.get("usage") if isinstance(enriched.get("usage"), dict) else {}
+    input_tokens = numeric_or_zero(usage.get("inputTokens") or usage.get("input_tokens"))
+    usable_context = numeric_or_zero(enriched.get("usableContextTokens"))
+    if usable_context > 0:
+        if enriched.get("remainingTokens") is None:
+            enriched["remainingTokens"] = max(usable_context - input_tokens, 0)
+        if enriched.get("usedPercent") is None:
+            enriched["usedPercent"] = round(max(0.0, min(100.0, (input_tokens / usable_context) * 100)), 2)
+    return enriched
+
+
+def price_for_model(catalog: dict[str, dict[str, float]], model: str) -> dict[str, float] | None:
+    normalized = normalize_model_key(model)
+    if normalized in catalog:
+        return catalog[normalized]
+    openrouter_key = f"{OPENROUTER_PROVIDER_PREFIX}{normalized}"
+    if openrouter_key in catalog:
+        return catalog[openrouter_key]
+    for key, rates in catalog.items():
+        if normalized.startswith(key):
+            return rates
+    return None
+
+
+def normalize_model_key(model: str) -> str:
+    return model.strip().lower()
+
+
+def calculate_micro_cost(
+    *,
+    billable_input_tokens: int,
+    cached_tokens: int,
+    output_tokens: int,
+    rates: dict[str, float],
+    basis: str,
+) -> int:
+    input_cost = billable_input_tokens * rates.get("input", 0.0)
+    cached_cost = cached_tokens * rates.get("cached", rates.get("input", 0.0))
+    output_cost = output_tokens * rates.get("output", 0.0)
+    if basis == "per_token":
+        return int(round((input_cost + cached_cost + output_cost) * 1_000_000))
+    return int(round(input_cost + cached_cost + output_cost))
+
+
+def numeric_or_none(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def numeric_or_zero_float(value) -> float:
+    number = numeric_or_none(value)
+    return number if number is not None else 0.0
+
+
+def numeric_or_zero(value) -> int:
+    number = numeric_or_none(value)
+    return int(number) if number is not None else 0
+
+
 def default_workspace_id(user_id: str) -> str:
     return f"workspace_{user_id}"
 
@@ -212,6 +434,37 @@ def require_run_owner(run_id: str, user: dict) -> tuple[dict, dict]:
     return run, conversation
 
 
+def require_attachment_owner(attachment_id: str, user: dict) -> dict:
+    attachment = store.get_attachment(attachment_id)
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    if attachment["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return attachment
+
+
+def require_run_attachments(attachment_ids: list[str], user: dict, workspace_id: str) -> list[dict]:
+    attachments = store.list_attachments(attachment_ids)
+    if len(attachments) != len(attachment_ids):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    for attachment in attachments:
+        if attachment["user_id"] != user["id"] or attachment["workspace_id"] != workspace_id:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+    return attachments
+
+
+def unique_attachment_ids(attachment_ids: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in attachment_ids:
+        attachment_id = str(value or "").strip()
+        if not attachment_id or attachment_id in seen:
+            continue
+        seen.add(attachment_id)
+        result.append(attachment_id)
+    return result
+
+
 class AuthRequest(BaseModel):
     account: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=4, max_length=128)
@@ -243,7 +496,8 @@ class CreateConversationResponse(BaseModel):
 
 
 class CreateRunRequest(BaseModel):
-    message: str = Field(min_length=1)
+    message: str = Field(default="", max_length=200000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=MAX_ATTACHMENTS_PER_MESSAGE)
     model: str | None = Field(default=None, min_length=1, max_length=80)
     reasoning_effort: ReasoningEffort | None = None
     speed_mode: SpeedMode = "fast"
@@ -281,6 +535,18 @@ class WriteWorkspaceFileRequest(BaseModel):
     content: str
     message: str = "write file"
     content_type: str = "text/plain; charset=utf-8"
+
+
+class UpdateAttachmentOpenAIFileRequest(BaseModel):
+    openai_file_id: str | None = None
+    openai_status: str = Field(pattern="^(pending|uploaded|failed|skipped)$")
+    openai_error: str | None = None
+    openai_purpose: str | None = None
+
+
+class UpdateRunAttachmentRequest(BaseModel):
+    included_as: str | None = None
+    error: str | None = None
 
 
 class WorkspaceGrepRequest(BaseModel):
@@ -321,6 +587,7 @@ def health() -> dict:
                 "speed_modes": list(SERVICE_TIER_BY_SPEED_MODE.keys()),
                 "reasoning_efforts": ["low", "medium", "high", "xhigh"],
             },
+            "usage": model_catalog_payload(settings),
         },
         "codex_relay": {
             "enabled": settings.codex_relay_enabled,
@@ -384,6 +651,12 @@ def auth_me(current_user: dict = Depends(get_current_user)) -> dict:
     return {"user": public_user(current_user), "workspace": workspace}
 
 
+@app.get("/api/models/catalog")
+def get_model_catalog(current_user: dict = Depends(get_current_user)) -> dict:
+    _ = current_user
+    return model_catalog_payload(settings)
+
+
 @app.post("/api/auth/logout")
 def logout(authorization: str | None = Header(default=None)) -> dict:
     store.delete_auth_session(auth_token_hash_from_request(authorization))
@@ -405,11 +678,17 @@ def get_user(user_id: str) -> dict:
 
 @app.post("/api/workspaces")
 def create_workspace(body: CreateWorkspaceRequest, current_user: dict = Depends(get_current_user)) -> dict:
-    workspace_id = body.id or default_workspace_id(current_user["id"])
+    workspace_id = body.id or f"workspace_{uuid.uuid4().hex}"
     try:
         return store.create_workspace(user_id=current_user["id"], workspace_id=workspace_id, name=body.name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/workspaces")
+def list_workspaces(current_user: dict = Depends(get_current_user)) -> dict:
+    ensure_user_workspace(current_user)
+    return {"workspaces": store.list_workspaces(user_id=current_user["id"])}
 
 
 @app.get("/api/workspaces/{workspace_id}")
@@ -441,6 +720,58 @@ def list_workspace_file_ops(
         return {"ops": store.list_file_ops(workspace_id=workspace_id, version_id=version_id)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/attachments")
+async def upload_attachments(
+    workspace_id: str | None = Query(default=None),
+    files: list[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded")
+    if len(files) > MAX_ATTACHMENTS_PER_MESSAGE:
+        raise HTTPException(status_code=400, detail=f"At most {MAX_ATTACHMENTS_PER_MESSAGE} files can be uploaded")
+
+    workspace = ensure_user_workspace(current_user)
+    target_workspace_id = workspace_id or workspace["id"]
+    require_workspace_owner(target_workspace_id, current_user)
+
+    attachments = []
+    for file in files:
+        attachments.append(
+            await store_uploaded_attachment(
+                file=file,
+                user=current_user,
+                workspace_id=target_workspace_id,
+                object_store=object_store,
+            )
+        )
+    return {"attachments": [public_attachment(item) for item in attachments]}
+
+
+@app.get("/api/attachments/{attachment_id}/content")
+def read_attachment_content(
+    attachment_id: str,
+    current_user: dict = Depends(get_current_user),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> Response:
+    attachment = require_attachment_owner(attachment_id, current_user)
+    try:
+        data = object_store.read_bytes(attachment["oss_blob_key"])
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="Attachment blob is missing from Aliyun OSS") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return Response(
+        content=data,
+        media_type=attachment["content_type"] or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{attachment["safe_name"]}"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
 
 
 @app.get("/internal/workspaces/{workspace_id}/files")
@@ -686,12 +1017,33 @@ async def create_run(
     current_user: dict = Depends(get_current_user),
 ) -> CreateRunResponse:
     conversation = require_conversation_owner(conversation_id, current_user)
+    message_text = body.message.strip()
+    attachment_ids = unique_attachment_ids(body.attachment_ids)
+    if not message_text and not attachment_ids:
+        raise HTTPException(status_code=400, detail="Message or attachments are required")
+    if len(attachment_ids) > MAX_ATTACHMENTS_PER_MESSAGE:
+        raise HTTPException(status_code=400, detail=f"At most {MAX_ATTACHMENTS_PER_MESSAGE} attachments can be sent")
+    attachments = require_run_attachments(
+        attachment_ids=attachment_ids,
+        user=current_user,
+        workspace_id=conversation["workspace_id"],
+    )
+    input_payload = {
+        "text": message_text,
+        "attachments": [public_attachment(attachment) for attachment in attachments],
+    }
     run_settings = resolve_run_settings(body, settings)
     run_id = f"run_{uuid.uuid4().hex}"
     previous_messages = store.list_messages(conversation_id)
     try:
         seeded_session_item_count = store.ensure_agent_session_seeded_from_messages(conversation_id, previous_messages)
-        store.create_run(run_id=run_id, conversation_id=conversation_id, user_message=body.message)
+        store.create_run(
+            run_id=run_id,
+            conversation_id=conversation_id,
+            user_message=message_text,
+            input_payload=input_payload,
+            attachments=input_payload["attachments"],
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     store.append_event(
@@ -703,6 +1055,7 @@ async def create_run(
                 "workspaceId": conversation["workspace_id"],
                 "historyMessageCount": len(previous_messages) + 1,
                 "sessionSeedItemCount": seeded_session_item_count,
+                "attachmentCount": len(attachments),
                 **run_settings.model_dump(),
             },
         },
@@ -711,7 +1064,6 @@ async def create_run(
         start_node_worker(
             run_id=run_id,
             conversation_id=conversation_id,
-            message=body.message,
             workspace_id=conversation["workspace_id"],
             run_settings=run_settings,
         )
@@ -727,6 +1079,32 @@ async def create_run(
 def get_run(run_id: str, current_user: dict = Depends(get_current_user)) -> dict:
     run, _conversation = require_run_owner(run_id, current_user)
     return run
+
+
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+    run, _conversation = require_run_owner(run_id, current_user)
+    if run["status"] in TERMINAL_RUN_STATUSES:
+        return {"ok": True, "status": run["status"]}
+
+    store.set_run_status(run_id, "cancelled")
+    store.append_event(
+        run_id,
+        {
+            "type": "run.cancelled",
+            "visibility": "user",
+            "status": "cancelled",
+            "payload": {"reason": "user_cancelled"},
+        },
+    )
+    terminated = terminate_worker_process(run_id)
+    return {"ok": True, "status": "cancelled", "terminated": terminated}
+
+
+@app.get("/api/runs/{run_id}/usage")
+def get_run_usage(run_id: str, current_user: dict = Depends(get_current_user)) -> dict:
+    require_run_owner(run_id, current_user)
+    return store.get_run_usage_summary(run_id)
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -750,10 +1128,24 @@ def append_worker_event(
     body: WorkerEventRequest,
     _authorized: None = Depends(require_worker_token),
 ) -> dict:
-    if not store.get_run(run_id):
+    run = store.get_run(run_id)
+    if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] in TERMINAL_RUN_STATUSES:
+        return {"ok": True, "ignored": True, "status": run["status"]}
 
-    event = store.append_event(run_id, body.model_dump(exclude_none=True))
+    event_body = body.model_dump(exclude_none=True)
+    if body.type == "model.usage":
+        context = store.get_context_snapshot(run_id, body.payload.get("callId"))
+        event_body["payload"] = enrich_usage_payload(usage_payload_with_context(body.payload, context), settings)
+
+    event = store.append_event(run_id, event_body)
+
+    if body.type == "context.estimated":
+        store.record_context_estimate(run_id, event_body["payload"])
+
+    if body.type == "model.usage":
+        store.record_model_usage(run_id, event_body["payload"], visibility=body.visibility)
 
     if body.type == "assistant.message.done":
         run = store.get_run(run_id)
@@ -769,6 +1161,87 @@ def append_worker_event(
         store.set_run_status(run_id, "running")
 
     return {"ok": True, "event": event}
+
+
+@app.get("/internal/runs/{run_id}/input")
+def get_worker_run_input(
+    run_id: str,
+    _authorized: None = Depends(require_worker_token),
+) -> dict:
+    data = store.get_run_input(run_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return data
+
+
+@app.patch("/internal/runs/{run_id}/attachments/{attachment_id}")
+def update_worker_run_attachment(
+    run_id: str,
+    attachment_id: str,
+    body: UpdateRunAttachmentRequest,
+    _authorized: None = Depends(require_worker_token),
+) -> dict:
+    if not store.get_run(run_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not store.get_attachment(attachment_id):
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    store.set_run_attachment_result(
+        run_id=run_id,
+        attachment_id=attachment_id,
+        included_as=body.included_as,
+        error=body.error,
+    )
+    return {"ok": True}
+
+
+@app.get("/internal/attachments/{attachment_id}")
+def get_worker_attachment(
+    attachment_id: str,
+    _authorized: None = Depends(require_worker_token),
+) -> dict:
+    attachment = store.get_attachment(attachment_id)
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {"attachment": public_attachment(attachment, include_internal=True)}
+
+
+@app.get("/internal/attachments/{attachment_id}/bytes")
+def read_worker_attachment_bytes(
+    attachment_id: str,
+    _authorized: None = Depends(require_worker_token),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    attachment = store.get_attachment(attachment_id)
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    try:
+        data = object_store.read_bytes(attachment["oss_blob_key"])
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="Attachment blob is missing from Aliyun OSS") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "attachment": public_attachment(attachment, include_internal=True),
+        "content_base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
+@app.patch("/internal/attachments/{attachment_id}/openai-file")
+def update_worker_attachment_openai_file(
+    attachment_id: str,
+    body: UpdateAttachmentOpenAIFileRequest,
+    _authorized: None = Depends(require_worker_token),
+) -> dict:
+    attachment = store.update_attachment_openai_file(
+        attachment_id=attachment_id,
+        openai_file_id=body.openai_file_id,
+        openai_status=body.openai_status,
+        openai_error=body.openai_error,
+        openai_purpose=body.openai_purpose,
+    )
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {"attachment": public_attachment(attachment, include_internal=True)}
 
 
 @app.get("/internal/conversations/{conversation_id}/agent-session/items")
@@ -857,6 +1330,11 @@ def resolve_run_settings(body: CreateRunRequest, app_settings: Settings) -> RunE
             status_code=400,
             detail="Model must contain only letters, numbers, '.', '_', ':' or '-' and be at most 80 characters",
         )
+    if normalize_model_key(model) not in SUPPORTED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported model. Supported models: gpt-5.4, gpt-5.5",
+        )
 
     reasoning_effort = body.reasoning_effort or cast_reasoning_effort(app_settings.openai_reasoning_effort)
     reasoning_summary = app_settings.openai_reasoning_summary
@@ -883,13 +1361,167 @@ def cast_reasoning_effort(value: str) -> ReasoningEffort:
     return "medium"
 
 
+async def store_uploaded_attachment(
+    *,
+    file: UploadFile,
+    user: dict,
+    workspace_id: str,
+    object_store: AliyunObjectStore,
+) -> dict:
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail=f"Uploaded file is empty: {file.filename or 'unnamed'}")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=400, detail=f"Uploaded file is too large: {file.filename or 'unnamed'}")
+
+    original_name = file.filename or "attachment"
+    safe_name = safe_filename(original_name)
+    content_type = detect_content_type(data, original_name, file.content_type)
+    model_kind = attachment_model_kind(content_type, safe_name)
+    image_detail = "original" if model_kind == "image" else None
+    openai_purpose = "vision" if model_kind == "image" else "user_data"
+
+    blob = object_store.put_bytes(data, content_type=content_type)
+    attachment_id = f"att_{uuid.uuid4().hex}"
+    workspace_path = attachment_workspace_path(attachment_id, safe_name)
+    try:
+        store.write_workspace_file(
+            workspace_id=workspace_id,
+            path=workspace_path,
+            blob_key=blob["key"],
+            blob_sha256=blob["sha256"],
+            size=blob["size"],
+            content_type=content_type,
+            message=f"upload attachment {safe_name}",
+        )
+        return store.create_attachment(
+            attachment_id=attachment_id,
+            user_id=user["id"],
+            workspace_id=workspace_id,
+            original_name=original_name,
+            safe_name=safe_name,
+            content_type=content_type,
+            size=blob["size"],
+            sha256=blob["sha256"],
+            oss_blob_key=blob["key"],
+            workspace_path=workspace_path,
+            model_kind=model_kind,
+            image_detail=image_detail,
+            openai_purpose=openai_purpose,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def safe_filename(filename: str) -> str:
+    name = filename.replace("\\", "/").rsplit("/", 1)[-1].strip().strip(".")
+    if not name:
+        name = "attachment"
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "_", name)
+    safe = re.sub(r"\s+", " ", safe).strip()
+    if not safe or safe in {".", ".."}:
+        safe = "attachment"
+    if len(safe) > 120:
+        stem, dot, suffix = safe.rpartition(".")
+        if dot and len(suffix) <= 16:
+            safe = f"{stem[: max(1, 119 - len(suffix))]}.{suffix}"
+        else:
+            safe = safe[:120]
+    return safe
+
+
+def attachment_workspace_path(attachment_id: str, safe_name: str) -> str:
+    date_part = datetime.now(UTC).strftime("%Y%m%d")
+    return f"attachments/{date_part}/{attachment_id}-{safe_name}"
+
+
+def detect_content_type(data: bytes, filename: str, provided: str | None) -> str:
+    guessed, _encoding = mimetypes.guess_type(filename)
+    if guessed and guessed != "application/zip":
+        return guessed
+    sniffed = sniff_content_type(data)
+    if sniffed:
+        return sniffed
+    if guessed:
+        return guessed
+    provided_type = (provided or "").split(";", 1)[0].strip().lower()
+    if provided_type and provided_type != "application/octet-stream":
+        return provided_type
+    return "application/octet-stream"
+
+
+def sniff_content_type(data: bytes) -> str | None:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"%PDF-"):
+        return "application/pdf"
+    if data.startswith(b"PK\x03\x04"):
+        guessed, _encoding = mimetypes.guess_type("")
+        return guessed or "application/zip"
+    return None
+
+
+def attachment_model_kind(content_type: str, filename: str) -> str:
+    normalized = content_type.split(";", 1)[0].lower()
+    if normalized in IMAGE_CONTENT_TYPES:
+        return "image"
+    if normalized.startswith("text/"):
+        return "file"
+    if normalized in {
+        "application/pdf",
+        "application/json",
+        "application/xml",
+        "application/zip",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }:
+        return "file"
+    suffix = PurePosixPath(filename).suffix.lower()
+    if suffix in {".txt", ".md", ".csv", ".json", ".xml", ".html", ".css", ".js", ".ts", ".py", ".java", ".go", ".rs", ".cpp", ".c", ".h", ".sql", ".yaml", ".yml", ".pdf", ".docx", ".xlsx", ".pptx"}:
+        return "file"
+    return "file"
+
+
+def public_attachment(attachment: dict, include_internal: bool = False) -> dict:
+    result = {
+        "id": attachment["id"],
+        "filename": attachment["original_name"],
+        "safe_name": attachment["safe_name"],
+        "content_type": attachment["content_type"],
+        "size": attachment["size"],
+        "sha256": attachment["sha256"],
+        "workspace_path": attachment["workspace_path"],
+        "model_kind": attachment["model_kind"],
+        "image_detail": attachment.get("image_detail"),
+        "openai_file_id": attachment.get("openai_file_id"),
+        "openai_purpose": attachment.get("openai_purpose"),
+        "openai_status": attachment.get("openai_status"),
+        "openai_error": attachment.get("openai_error"),
+        "created_at": attachment.get("created_at"),
+    }
+    if include_internal:
+        result["oss_blob_key"] = attachment.get("oss_blob_key")
+        result["user_id"] = attachment.get("user_id")
+        result["workspace_id"] = attachment.get("workspace_id")
+    return result
+
+
 async def start_node_worker(
     run_id: str,
     conversation_id: str,
-    message: str,
     workspace_id: str,
     run_settings: RunExecutionSettings,
 ) -> None:
+    run = store.get_run(run_id)
+    if not run or run["status"] in TERMINAL_RUN_STATUSES:
+        return
     store.set_run_status(run_id, "running")
     worker_entry = settings.worker_entry_path
     sandbox_dir = settings.worker_sandbox_root_path / run_id
@@ -915,7 +1547,6 @@ async def start_node_worker(
             "CONVERSATION_ID": conversation_id,
             "WORKSPACE_ID": workspace_id,
             "SANDBOX_DIR": str(sandbox_dir),
-            "USER_MESSAGE": message,
             "OPENAI_MODEL": run_settings.model,
             "OPENAI_REASONING_EFFORT": run_settings.reasoning_effort,
             "OPENAI_REASONING_SUMMARY": run_settings.reasoning_summary,
@@ -949,6 +1580,10 @@ async def start_node_worker(
         store.set_run_status(run_id, "failed")
         return
 
+    run = store.get_run(run_id)
+    if not run or run["status"] in TERMINAL_RUN_STATUSES:
+        return
+
     try:
         code = await asyncio.to_thread(
             run_worker_process,
@@ -967,6 +1602,10 @@ async def start_node_worker(
             },
         )
         store.set_run_status(run_id, "failed")
+        return
+
+    run = store.get_run(run_id)
+    if run and run["status"] == "cancelled":
         return
 
     if code != 0:
@@ -998,13 +1637,46 @@ def run_worker_process(
         encoding="utf-8",
         errors="replace",
     )
-    stdout_text, stderr_text = process.communicate()
-    for name, text_block in (("stdout", stdout_text), ("stderr", stderr_text)):
-        for text in text_block.splitlines()[-80:]:
-            text = text.rstrip()
-            if text:
-                print(f"[worker:{run_id}:{name}] {text}", file=sys.stderr)
-    return process.returncode
+    register_worker_process(run_id, process)
+    try:
+        stdout_text, stderr_text = process.communicate()
+        for name, text_block in (("stdout", stdout_text), ("stderr", stderr_text)):
+            for text in text_block.splitlines()[-80:]:
+                text = text.rstrip()
+                if text:
+                    print(f"[worker:{run_id}:{name}] {text}", file=sys.stderr)
+        return process.returncode
+    finally:
+        unregister_worker_process(run_id, process)
+
+
+def register_worker_process(run_id: str, process: subprocess.Popen) -> None:
+    with run_processes_lock:
+        run_processes[run_id] = process
+
+
+def unregister_worker_process(run_id: str, process: subprocess.Popen) -> None:
+    with run_processes_lock:
+        if run_processes.get(run_id) is process:
+            run_processes.pop(run_id, None)
+
+
+def terminate_worker_process(run_id: str) -> bool:
+    with run_processes_lock:
+        process = run_processes.get(run_id)
+    if not process or process.poll() is not None:
+        return False
+
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    return True
 
 
 def iter_workspace_text_files(

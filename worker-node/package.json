@@ -5,11 +5,12 @@
   "private": true,
   "scripts": {
     "start": "node src/worker.mjs",
-    "check": "node --check src/worker.mjs && node --check src/session.mjs && node --check src/sdk-events.mjs && node --check src/model-provider.mjs && node --check src/tools/workspace.mjs && node --check src/tools/sandbox.mjs",
+    "check": "node --check src/worker.mjs && node --check src/session.mjs && node --check src/attachments.mjs && node --check src/sdk-events.mjs && node --check src/model-provider.mjs && node --check src/tools/workspace.mjs && node --check src/tools/sandbox.mjs",
     "test:events": "node -e \"import('./src/sdk-events.mjs').then(({SdkEventNormalizer})=>{const n=new SdkEventNormalizer(); const text=n.normalize({type:'raw_model_stream_event',data:{type:'output_text_delta',delta:'ok'}}); const reasoning=n.normalize({type:'raw_model_stream_event',data:{type:'model',event:{type:'response.reasoning_summary_text.delta',delta:'think'}}}); const done=n.normalize({type:'run_item_stream_event',name:'reasoning_item_created',item:{type:'reasoning_item',rawItem:{id:'r1',content:[{text:'summary'}]}}}); if(text[0]?.type!=='assistant.message.delta'||reasoning[0]?.type!=='assistant.reasoning_summary.delta'||done[0]?.payload?.text!=='summary') process.exit(1); console.log('event mapper ok');})\""
   },
   "dependencies": {
     "@openai/agents": "^0.11.4",
+    "js-tiktoken": "^1.0.21",
     "zod": "^4.4.3"
   }
 }
