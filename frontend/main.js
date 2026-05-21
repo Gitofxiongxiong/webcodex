@@ -38,7 +38,11 @@ const eventTypes = [
   "codex.command.started",
   "codex.command.output.delta",
   "codex.command.completed",
+  "codex.patch.started",
+  "codex.patch.completed",
   "codex.file.changed",
+  "workspace.version.created",
+  "artifact.preview",
   "run.completed",
   "run.failed",
   "run.cancelled",
@@ -527,7 +531,7 @@ function App() {
       setUsagePanel((current) => usagePanelFromEstimate(event.payload, current));
     } else if (event.type === "model.usage") {
       setUsagePanel((current) => usagePanelFromModelUsage(event.payload, current));
-    } else if (event.type.startsWith("tool.call.")) {
+    } else if (event.type.startsWith("tool.call.") || event.type.startsWith("codex.") || event.type === "workspace.version.created" || event.type === "artifact.preview") {
       updateTool(assistantId, event);
     } else if (event.type === "run.completed") {
       updateAssistant(assistantId, { streaming: false });
@@ -792,8 +796,8 @@ function App() {
       };
       const next = {
         ...current,
-        name: event.payload?.name ?? current.name,
-        status: event.status ?? event.type.replace("tool.call.", ""),
+        name: event.payload?.name ?? displayEventName(event.type, current.name),
+        status: event.status ?? statusFromEventType(event.type),
         detail: toolDetail(current.detail, event),
       };
       if (existingIndex >= 0) {
@@ -2420,6 +2424,31 @@ function toolBlocks(blocks) {
   return blocks.filter((block) => block.type === "tool");
 }
 
+function displayEventName(type, fallback) {
+  const labels = {
+    "codex.command.started": "shell",
+    "codex.command.completed": "shell",
+    "codex.patch.started": "apply_patch",
+    "codex.patch.completed": "apply_patch",
+    "workspace.version.created": "workspace_export",
+    "artifact.preview": "viewTool2",
+  };
+  return labels[type] ?? fallback ?? "工具调用";
+}
+
+function statusFromEventType(type) {
+  if (type.endsWith(".completed") || type === "workspace.version.created" || type === "artifact.preview") {
+    return "completed";
+  }
+  if (type.endsWith(".failed")) {
+    return "failed";
+  }
+  if (type.endsWith(".started") || type.endsWith(".delta")) {
+    return "running";
+  }
+  return type.replace("tool.call.", "");
+}
+
 function toolStatusLabel(status) {
   const labels = {
     running: "执行中",
@@ -2457,6 +2486,39 @@ function toolDetail(previous, event) {
   }
   if (event.type === "tool.call.failed") {
     return event.payload?.error ?? "工具执行失败";
+  }
+  if (event.type === "codex.command.started") {
+    return formatPayload({
+      command: event.payload?.command,
+      cwd: event.payload?.cwd,
+    });
+  }
+  if (event.type === "codex.command.completed") {
+    return formatPayload({
+      exitCode: event.payload?.exitCode,
+      timedOut: event.payload?.timedOut,
+      durationMs: event.payload?.durationMs,
+      stdout: event.payload?.stdout,
+      stderr: event.payload?.stderr,
+    });
+  }
+  if (event.type === "codex.patch.started") {
+    return formatPayload(event.payload?.operation ?? event.payload ?? {});
+  }
+  if (event.type === "codex.patch.completed") {
+    return formatPayload({
+      status: event.payload?.status,
+      output: event.payload?.output,
+    });
+  }
+  if (event.type === "workspace.version.created") {
+    return formatPayload({
+      versionId: event.payload?.versionId,
+      exported: event.payload?.exported,
+    });
+  }
+  if (event.type === "artifact.preview") {
+    return formatPayload(event.payload?.preview ?? event.payload ?? {});
   }
   return formatPayload(event.payload ?? {});
 }

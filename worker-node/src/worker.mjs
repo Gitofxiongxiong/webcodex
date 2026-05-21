@@ -1,12 +1,15 @@
-import { Agent, OpenAIProvider, Runner, webSearchTool } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner, applyPatchTool, shellTool, webSearchTool } from "@openai/agents";
 
 import { event, mustEnv, optionalEnv, postEvent, postEvents } from "./protocol.mjs";
 import { SdkEventNormalizer, toJsonSafe } from "./sdk-events.mjs";
 import { createModelProvider } from "./model-provider.mjs";
 import { BackendConversationSession } from "./session.mjs";
 import { AttachmentClient, createOpenAIUploadClient } from "./attachments.mjs";
-import { makeSandboxTools } from "./tools/sandbox.mjs";
-import { makeWorkspaceTools } from "./tools/workspace.mjs";
+import { createAgentRuntime, RuntimeShellExecutor } from "./runtime/docker-runtime.mjs";
+import { RuntimeWorkspaceEditor } from "./runtime/workspace-editor.mjs";
+import { makeRuntimeWorkspaceTools } from "./tools/runtime-workspace.mjs";
+import { makeViewTool2 } from "./tools/view-tool2.mjs";
+import { makeRuntimeFunctionTools } from "./tools/runtime-fallback.mjs";
 
 const ASSISTANT_ITEM_ID = "assistant_1";
 
@@ -14,7 +17,8 @@ async function main() {
   const runId = mustEnv("RUN_ID");
   const conversationId = mustEnv("CONVERSATION_ID");
   const workspaceId = mustEnv("WORKSPACE_ID");
-  const sandboxDir = mustEnv("SANDBOX_DIR");
+  const runWorkspaceDir = mustEnv("RUN_WORKSPACE_DIR");
+  const runArtifactsDir = mustEnv("RUN_ARTIFACTS_DIR");
   const apiBaseUrl = mustEnv("API_BASE_URL");
   const workerToken = mustEnv("WORKER_TOKEN");
   const model = optionalEnv("OPENAI_MODEL", "gpt-5.4");
@@ -26,12 +30,27 @@ async function main() {
   const storeResponses = optionalEnv("OPENAI_STORE", "false") === "true";
   const providerLabel = optionalEnv("OPENAI_MODEL_PROVIDER", "openai");
   const debugModelRequests = optionalEnv("WORKER_DEBUG_MODEL_REQUESTS", "false") === "true";
+  const runtime = await createAgentRuntime({
+    mode: optionalEnv("WORKER_RUNTIME", "docker"),
+    runId,
+    workspaceDir: runWorkspaceDir,
+    artifactsDir: runArtifactsDir,
+    image: optionalEnv("WORKER_DOCKER_IMAGE", "webcodex-agent-runtime:latest"),
+    containerName: optionalEnv("WORKER_CONTAINER_NAME", ""),
+    autoBuild: optionalEnv("WORKER_DOCKER_AUTO_BUILD", "true") === "true",
+    dockerfilePath: optionalEnv("WORKER_DOCKERFILE", ""),
+    network: optionalEnv("WORKER_DOCKER_NETWORK", "bridge"),
+    cpus: optionalEnv("WORKER_DOCKER_CPUS", "2"),
+    memory: optionalEnv("WORKER_DOCKER_MEMORY", "4g"),
+    pidsLimit: optionalEnv("WORKER_DOCKER_PIDS_LIMIT", "512"),
+    keepContainer: optionalEnv("WORKER_KEEP_CONTAINER", "false") === "true",
+  });
   const session = new BackendConversationSession({ conversationId, apiBaseUrl, workerToken });
   const sessionItems = await session.getItems();
   const attachmentClient = new AttachmentClient({
     apiBaseUrl,
     workerToken,
-    sandboxDir,
+    sandboxDir: runWorkspaceDir,
     openaiClient: createOpenAIUploadClient(),
   });
   const runInputPayload = await attachmentClient.getRunInput(runId);
@@ -46,8 +65,12 @@ async function main() {
       runId,
       conversationId,
       workspaceId,
-      sandboxDir,
       runtime: "openai-agents-js",
+      runtimeMode: runtime.mode,
+      runWorkspaceDir,
+      runArtifactsDir,
+      containerName: runtime.containerName,
+      containerId: runtime.containerId,
       model,
       reasoningEffort,
       reasoningSummary,
@@ -67,7 +90,7 @@ async function main() {
   const agent = createCodexAgent({
     model,
     workspaceId,
-    sandboxDir,
+    runtime,
     apiBaseUrl,
     workerToken,
     reasoningEffort,
@@ -75,59 +98,63 @@ async function main() {
     textVerbosity,
     serviceTier,
     storeResponses,
+    providerLabel,
   });
   const provider = createModelProvider({
     provider: createOpenAIProvider(),
     debugModelRequests,
   });
-  const runner = new Runner({
-    modelProvider: provider,
-    tracingDisabled: true,
-    workflowName: "WebCodex SDK run",
-    traceIncludeSensitiveData: false,
-  });
-  const normalizer = new SdkEventNormalizer({ assistantItemId: ASSISTANT_ITEM_ID });
-  const stream = await runner.run(agent, runInput, {
-    stream: true,
-    session,
-    sessionInputCallback: (historyItems, newItems) => attachmentClient.sessionInputCallback(historyItems, newItems),
-    maxTurns: positiveIntEnv("OPENAI_MAX_TURNS", 12),
-    reasoningItemIdPolicy: "omit",
-    callModelInputFilter: omitReasoningItemsFromReplay,
-  });
+  try {
+    const runner = new Runner({
+      modelProvider: provider,
+      tracingDisabled: true,
+      workflowName: "WebCodex SDK run",
+      traceIncludeSensitiveData: false,
+    });
+    const normalizer = new SdkEventNormalizer({ assistantItemId: ASSISTANT_ITEM_ID });
+    const stream = await runner.run(agent, runInput, {
+      stream: true,
+      session,
+      sessionInputCallback: (historyItems, newItems) => attachmentClient.sessionInputCallback(historyItems, newItems),
+      maxTurns: positiveIntEnv("OPENAI_MAX_TURNS", 12),
+      reasoningItemIdPolicy: "omit",
+      callModelInputFilter: omitReasoningItemsFromReplay,
+    });
 
-  for await (const sdkEvent of stream) {
-    await postEvents(normalizer.normalize(sdkEvent));
-  }
+    for await (const sdkEvent of stream) {
+      await postEvents(normalizer.normalize(sdkEvent));
+    }
 
-  await stream.completed;
+    await stream.completed;
 
-  await postEvent(
-    event(
-      "assistant.message.done",
-      {
-        text: stringifyFinalOutput(stream.finalOutput),
+    await postEvent(
+      event(
+        "assistant.message.done",
+        {
+          text: stringifyFinalOutput(stream.finalOutput),
+          lastAgent: stream.lastAgent?.name,
+          lastResponseId: stream.lastResponseId,
+        },
+        { itemId: ASSISTANT_ITEM_ID, status: "completed" }
+      )
+    );
+    await postEvent(
+      event("run.completed", {
+        ok: true,
         lastAgent: stream.lastAgent?.name,
         lastResponseId: stream.lastResponseId,
-      },
-      { itemId: ASSISTANT_ITEM_ID, status: "completed" }
-    )
-  );
-  await postEvent(
-    event("run.completed", {
-      ok: true,
-      lastAgent: stream.lastAgent?.name,
-      lastResponseId: stream.lastResponseId,
-    })
-  );
-
-  await provider.close();
+      })
+    );
+  } finally {
+    await provider.close();
+    await runtime.stop();
+  }
 }
 
 function createCodexAgent({
   model,
   workspaceId,
-  sandboxDir,
+  runtime,
   apiBaseUrl,
   workerToken,
   reasoningEffort,
@@ -135,7 +162,28 @@ function createCodexAgent({
   textVerbosity,
   serviceTier,
   storeResponses,
+  providerLabel,
 }) {
+  const nativeRuntimeTools = providerLabel === "codex-relay"
+    ? makeRuntimeFunctionTools({ runtime })
+    : [
+      shellTool({
+        name: "shell",
+        shell: new RuntimeShellExecutor({ runtime }),
+        needsApproval: false,
+      }),
+      applyPatchTool({
+        editor: new RuntimeWorkspaceEditor({ runtime }),
+        needsApproval: false,
+      }),
+    ];
+  const hostedTools = providerLabel === "codex-relay"
+    ? []
+    : [
+      webSearchTool({
+        searchContextSize: "medium",
+      }),
+    ];
   return new Agent({
     name: "WebCodex Coding Agent",
     model,
@@ -149,27 +197,27 @@ function createCodexAgent({
     instructions: [
       "You are the first real SDK-backed worker for WebCodex.",
       "Answer the user's coding request clearly and concretely.",
-      "Use sandbox tools for draft file creation, local file edits, bash commands, Python scripts, and verification.",
-      "Use workspace_import to copy workspace files into the sandbox before editing them locally.",
-      "Use workspace_read when you only need to inspect a workspace file without importing it.",
-      "Use workspace_export to publish a sandbox file back to the WebCodex workspace.",
-      "Use workspace_write only for direct simple workspace create/modify requests.",
+      "Use workspace_tree and workspace_rg to discover files in the persistent WebCodex workspace.",
+      "Use workspace_import to copy workspace files into Docker /sandbox before inspecting or editing them locally.",
+      "Use the shell tool for bash, Python, curl, rg, npm, tests, builds, HTML generation, and verification inside Docker /sandbox.",
+      "Use apply_patch for file edits inside Docker /sandbox.",
+      "Use viewTool2 only for bounded text, image, PDF, and metadata inspection of files that already exist inside Docker /sandbox.",
+      "viewTool2 cannot inspect host filesystem paths, /artifacts paths, or persistent WebCodex workspace paths directly; use workspace_import first when needed.",
+      "Use workspace_export to publish final Docker /sandbox files back to the WebCodex workspace.",
       "Uploaded attachments are already copied into the sandbox at the paths listed in the user message and are also provided as model inputs when supported.",
-      "Use sandbox_python or sandbox_bash to inspect, parse, convert, or analyze uploaded files and images.",
+      "Use shell or viewTool2 to inspect, parse, convert, or analyze uploaded files and images.",
       "Use web_search for current public information from the web when freshness matters.",
-      "Use sandbox_curl or the curl shell tool when you need to fetch or inspect a specific URL or HTTP endpoint.",
-      "The curl shell tool only allows curl commands; use sandbox_bash for other local shell work.",
-      "Only claim access to the run sandbox, web_search, curl, and workspace tools. Do not claim direct host filesystem access.",
+      "Use curl through the shell tool when you need to fetch or inspect a specific URL or HTTP endpoint.",
+      "Only claim access to Docker /sandbox, /artifacts, web_search, and workspace bridge tools. Do not claim direct host filesystem access.",
       "When you write or export a file, briefly mention the path and purpose.",
       `Current workspace id: ${workspaceId}.`,
-      `Current sandbox directory: ${sandboxDir}.`,
+      "Current Docker working directory: /sandbox.",
     ].join("\n"),
     tools: [
-      webSearchTool({
-        searchContextSize: "medium",
-      }),
-      ...makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspaceId }),
-      ...makeWorkspaceTools({ apiBaseUrl, workerToken, workspaceId }),
+      ...hostedTools,
+      ...nativeRuntimeTools,
+      ...makeRuntimeWorkspaceTools({ runtime, apiBaseUrl, workerToken, workspaceId }),
+      makeViewTool2({ runtime }),
     ],
   });
 }

@@ -63,15 +63,19 @@ export class AttachmentClient {
         openai_error: message,
         openai_purpose: attachment.openai_purpose ?? purposeForAttachment(attachment),
       }).catch(() => {});
-      const fallbackModelPart = IMAGE_KINDS.has(attachment.model_kind)
-        ? this.modelPartForAttachment({
-          ...attachment,
-          image_data_url: `data:${attachment.content_type || "image/png"};base64,${bytes.toString("base64")}`,
-        })
-        : this.modelPartForAttachment({
-          ...attachment,
-          file_data: bytes.toString("base64"),
-        });
+      const fallbackModelPart = this.openai
+        ? (IMAGE_KINDS.has(attachment.model_kind)
+          ? this.modelPartForAttachment({
+            ...attachment,
+            openai_file_id: "inline_image",
+            image_data_url: `data:${attachment.content_type || "image/png"};base64,${bytes.toString("base64")}`,
+          })
+          : this.modelPartForAttachment({
+            ...attachment,
+            openai_file_id: "inline_file",
+            file_data: bytes.toString("base64"),
+          }))
+        : null;
       await this.updateRunAttachment(runId, attachment.id, {
         included_as: fallbackModelPart?.type ?? "tool_only",
         error: message,
@@ -146,7 +150,7 @@ export class AttachmentClient {
   userTextWithAttachmentIndex(text, prepared) {
     const lines = [text.trim() || "Please analyze the attached files."];
     if (prepared.length) {
-      lines.push("", "Uploaded attachments are available both as model inputs and workspace/sandbox files:");
+      lines.push("", "Uploaded attachments are available both as model inputs and Docker /sandbox files; listed paths are /sandbox-relative:");
       for (const item of prepared) {
         const attachment = item.attachment;
         const status = item.error ? `tool_only: ${item.error}` : item.includedAs;
@@ -190,6 +194,9 @@ export class AttachmentClient {
 }
 
 export function createOpenAIUploadClient() {
+  if (process.env.OPENAI_MODEL_PROVIDER === "codex-relay") {
+    return null;
+  }
   const apiKey = process.env.OPENAI_API_KEY || "";
   if (!apiKey) {
     return null;

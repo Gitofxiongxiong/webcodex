@@ -111,11 +111,32 @@ export class WorkspaceApiClient {
     });
   }
 
+  async readFileBytes({ path, versionId }) {
+    const query = new URLSearchParams();
+    if (versionId) {
+      query.set("version_id", versionId);
+    }
+    return this.request(`/internal/workspaces/${encodeURIComponent(this.workspaceId)}/file-bytes/${encodePath(path)}`, {
+      query,
+    });
+  }
+
   async writeFile({ path, content, message, contentType }) {
     return this.request(`/internal/workspaces/${encodeURIComponent(this.workspaceId)}/files/${encodePath(path)}`, {
       method: "PUT",
       body: {
         content,
+        message,
+        content_type: contentType,
+      },
+    });
+  }
+
+  async writeFileBytes({ path, contentBase64, message, contentType }) {
+    return this.request(`/internal/workspaces/${encodeURIComponent(this.workspaceId)}/file-bytes/${encodePath(path)}`, {
+      method: "PUT",
+      body: {
+        content_base64: contentBase64,
         message,
         content_type: contentType,
       },
@@ -130,6 +151,22 @@ export class WorkspaceApiClient {
         path_glob: pathGlob,
         case_sensitive: caseSensitive,
         max_matches: maxMatches,
+      },
+    });
+  }
+
+  async rg({ pattern, pathGlob, caseSensitive, contextBefore, contextAfter, maxMatches, maxLineChars, cursor }) {
+    return this.request(`/internal/workspaces/${encodeURIComponent(this.workspaceId)}/rg`, {
+      method: "POST",
+      body: {
+        pattern,
+        path_glob: pathGlob,
+        case_sensitive: caseSensitive,
+        context_before: contextBefore,
+        context_after: contextAfter,
+        max_matches: maxMatches,
+        max_line_chars: maxLineChars,
+        cursor,
       },
     });
   }

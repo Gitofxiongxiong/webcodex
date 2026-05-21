@@ -272,6 +272,38 @@ export class SdkEventNormalizer {
       this.toolCalls.set(callId, normalized);
     }
 
+    if (raw.type === "shell_call" || item.type === "shell_call") {
+      const action = raw.action ?? args;
+      return event(
+        "codex.command.started",
+        {
+          name: "shell",
+          callId,
+          command: shellCommandText(action),
+          cwd: "/sandbox",
+          action: toJsonSafe(action),
+          source: "openai-agents",
+        },
+        { itemId: itemIdFor(callId, "command"), status: "running" }
+      );
+    }
+
+    if (raw.type === "apply_patch_call" || item.type === "apply_patch_call") {
+      const operation = raw.operation ?? args;
+      return event(
+        "codex.patch.started",
+        {
+          name: "apply_patch",
+          callId,
+          operation: toJsonSafe(operation),
+          path: operation?.path,
+          type: operation?.type,
+          source: "openai-agents",
+        },
+        { itemId: itemIdFor(callId, "patch"), status: "running" }
+      );
+    }
+
     return event(
       "tool.call.started",
       {
@@ -290,6 +322,72 @@ export class SdkEventNormalizer {
     const remembered = callId ? this.toolCalls.get(callId) : undefined;
     const output = "output" in item ? item.output : raw.output;
 
+    if (raw.type === "shell_call_output" || remembered?.name === "shell") {
+      const summary = shellOutputSummary(output);
+      return event(
+        "codex.command.completed",
+        {
+          name: "shell",
+          callId,
+          ...summary,
+          output: toJsonSafe(output),
+          source: "openai-agents",
+        },
+        { itemId: itemIdFor(callId, "command"), status: summary.ok ? "completed" : "failed" }
+      );
+    }
+
+    if (raw.type === "apply_patch_call_output" || remembered?.name === "apply_patch") {
+      return event(
+        "codex.patch.completed",
+        {
+          name: "apply_patch",
+          callId,
+          status: raw.status,
+          output: toJsonSafe(output),
+          source: "openai-agents",
+        },
+        { itemId: itemIdFor(callId, "patch"), status: raw.status === "failed" ? "failed" : "completed" }
+      );
+    }
+
+    if (remembered?.name === "workspace_export") {
+      const parsed = parseJsonMaybe(output);
+      const payload = typeof parsed === "string" ? parseJsonMaybe(parsed) : parsed;
+      if (payload?.version_id || payload?.exported) {
+        return event(
+          "workspace.version.created",
+          {
+            name: "workspace_export",
+            callId,
+            versionId: payload.version_id,
+            exported: payload.exported,
+            output: toJsonSafe(payload),
+            source: "openai-agents",
+          },
+          { itemId: itemIdFor(callId, "workspace_version"), status: "completed" }
+        );
+      }
+    }
+
+    if (remembered?.name === "viewTool2") {
+      const parsed = parseJsonMaybe(output);
+      const payload = typeof parsed === "string" ? parseJsonMaybe(parsed) : parsed;
+      if (payload?.mode === "image" || payload?.mode === "pdf") {
+        return event(
+          "artifact.preview",
+          {
+            name: "viewTool2",
+            callId,
+            preview: toJsonSafe(payload),
+            output: toJsonSafe(payload),
+            source: "openai-agents",
+          },
+          { itemId: itemIdFor(callId, "artifact"), status: "completed" }
+        );
+      }
+    }
+
     return event(
       "tool.call.completed",
       {
@@ -301,6 +399,26 @@ export class SdkEventNormalizer {
       { itemId: itemIdFor(callId, "tool"), status: "completed" }
     );
   }
+}
+
+function shellCommandText(action) {
+  const commands = Array.isArray(action?.commands) ? action.commands : [];
+  return commands.join("\n");
+}
+
+function shellOutputSummary(output) {
+  const rows = Array.isArray(output) ? output : [];
+  const last = rows.at(-1) ?? {};
+  const exitCode = last.outcome?.type === "exit" ? last.outcome.exitCode : null;
+  const timedOut = rows.some((row) => row?.outcome?.type === "timeout");
+  return {
+    ok: !timedOut && rows.every((row) => row?.outcome?.type === "exit" && row.outcome.exitCode === 0),
+    exitCode,
+    timedOut,
+    durationMs: numeric(last.duration_ms),
+    stdout: rows.map((row) => row?.stdout ?? "").filter(Boolean).join("\n"),
+    stderr: rows.map((row) => row?.stderr ?? "").filter(Boolean).join("\n"),
+  };
 }
 
 export function itemIdFor(value, fallbackPrefix) {

@@ -11,6 +11,16 @@ class Settings(BaseSettings):
     worker_token: str = "dev-worker-token"
     node_worker_entry: str = "../worker-node/src/worker.mjs"
     worker_sandbox_root: str = "../data/sandboxes"
+    worker_runs_root: str = "../data/runs"
+    worker_runtime: str = "docker"
+    worker_docker_image: str = "webcodex-agent-runtime:latest"
+    worker_docker_auto_build: bool = True
+    worker_docker_network: str = "bridge"
+    worker_docker_cpus: str = "2"
+    worker_docker_memory: str = "4g"
+    worker_docker_pids_limit: str = "512"
+    worker_keep_container: bool = False
+    worker_keep_run_dir: bool = True
     openai_api_key: str = ""
     openai_base_url: str = ""
     openai_model: str = "gpt-5.4"
@@ -59,6 +69,13 @@ class Settings(BaseSettings):
     @property
     def worker_sandbox_root_path(self) -> Path:
         path = Path(self.worker_sandbox_root)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[1] / path
+        return path.resolve()
+
+    @property
+    def worker_runs_root_path(self) -> Path:
+        path = Path(self.worker_runs_root)
         if not path.is_absolute():
             path = Path(__file__).resolve().parents[1] / path
         return path.resolve()

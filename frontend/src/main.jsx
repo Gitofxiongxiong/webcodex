@@ -10,6 +10,8 @@ const apiBaseUrlStorageKey = "webcodex.apiBaseUrl";
 const apiBaseUrl = resolveApiBaseUrl();
 const authStorageKey = "webcodex.auth";
 const h = React.createElement;
+const sidebarHistoryLimit = 5;
+const folderMarkerFile = ".webcodex-folder";
 
 const supportedModels = [
   { value: "gpt-5.4", label: "GPT-5.4" },
@@ -42,7 +44,11 @@ const eventTypes = [
   "codex.command.started",
   "codex.command.output.delta",
   "codex.command.completed",
+  "codex.patch.started",
+  "codex.patch.completed",
   "codex.file.changed",
+  "workspace.version.created",
+  "artifact.preview",
   "run.completed",
   "run.failed",
   "run.cancelled",
@@ -64,11 +70,12 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [view, setView] = useState("chat");
   const [workspaces, setWorkspaces] = useState([]);
-  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [workspaceFiles, setWorkspaceFiles] = useState([]);
+  const [workspaceFolders, setWorkspaceFolders] = useState([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceTreeOpen, setWorkspaceTreeOpen] = useState(false);
   const sourceRef = useRef(null);
   const activeAssistantIdRef = useRef(null);
   const currentRunIdRef = useRef(null);
@@ -108,11 +115,12 @@ function App() {
       setModelCatalog(null);
       setView("chat");
       setWorkspaces([]);
-      setSelectedWorkspaceId("");
       setWorkspaceFiles([]);
+      setWorkspaceFolders([]);
       setWorkspaceLoading(false);
       setWorkspaceFilesLoading(false);
       setWorkspaceError("");
+      setWorkspaceTreeOpen(false);
       setStatus("就绪");
     }
   }, [token]);
@@ -135,14 +143,10 @@ function App() {
   }, [view, token]);
 
   useEffect(() => {
-    if (!selectedWorkspaceId && workspaceId) {
-      setSelectedWorkspaceId(workspaceId);
-      return;
+    if (workspaceId) {
+      refreshWorkspaceFiles(workspaceId).catch((error) => setWorkspaceError(error.message));
     }
-    if (selectedWorkspaceId) {
-      refreshWorkspaceFiles(selectedWorkspaceId).catch((error) => setWorkspaceError(error.message));
-    }
-  }, [selectedWorkspaceId, workspaceId]);
+  }, [workspaceId]);
 
   useEffect(() => {
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" });
@@ -171,7 +175,6 @@ function App() {
     setConversations([]);
     setMessages([]);
     setView("chat");
-    setSelectedWorkspaceId(nextAuth?.workspace?.id ?? "");
   }
 
   async function refreshCurrentUser() {
@@ -206,7 +209,7 @@ function App() {
   }
 
   async function refreshConversations(activeId = conversationId) {
-    const params = new URLSearchParams({ limit: "80" });
+    const params = new URLSearchParams({ limit: "200" });
     if (workspaceId) {
       params.set("workspace_id", workspaceId);
     }
@@ -232,16 +235,16 @@ function App() {
       }
       const items = body.workspaces ?? [];
       setWorkspaces(items);
-      setSelectedWorkspaceId((current) => current || workspaceId || items[0]?.id || "");
       return items;
     } finally {
       setWorkspaceLoading(false);
     }
   }
 
-  async function refreshWorkspaceFiles(targetWorkspaceId = selectedWorkspaceId) {
+  async function refreshWorkspaceFiles(targetWorkspaceId = workspaceId) {
     if (!targetWorkspaceId) {
       setWorkspaceFiles([]);
+      setWorkspaceFolders([]);
       return [];
     }
     setWorkspaceFilesLoading(true);
@@ -252,47 +255,116 @@ function App() {
       if (!response.ok) {
         throw new Error(body.detail ?? "加载工作空间文件失败");
       }
-      const files = body.files ?? [];
+      const normalized = normalizeWorkspaceEntries(body.files ?? [], body.folders ?? []);
+      const files = normalized.files;
+      const folders = normalized.folders;
       setWorkspaceFiles(files);
-      return files;
+      setWorkspaceFolders(folders);
+      return { files, folders };
     } finally {
       setWorkspaceFilesLoading(false);
     }
   }
 
-  async function createWorkspace(name) {
-    const response = await apiFetch("/api/workspaces", {
+  async function createWorkspaceFolder(path) {
+    const targetWorkspaceId = workspaceId;
+    if (!targetWorkspaceId) {
+      throw new Error("工作空间不可用");
+    }
+    const response = await apiFetch(`/api/workspaces/${encodeURIComponent(targetWorkspaceId)}/folders`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ path }),
     });
     const body = await response.json();
-    if (!response.ok) {
-      throw new Error(body.detail ?? "创建工作空间失败");
+    if (response.status === 404) {
+      const fallback = await apiFetch(`/api/workspaces/${encodeURIComponent(targetWorkspaceId)}/files/${encodeWorkspacePath(joinPath(path, folderMarkerFile))}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          content: "",
+          content_type: "text/plain; charset=utf-8",
+          message: `create folder ${path}`,
+        }),
+      });
+      const fallbackBody = await fallback.json();
+      if (!fallback.ok) {
+        throw new Error(fallbackBody.detail ?? "创建文件夹失败");
+      }
+      await Promise.all([refreshWorkspaceFiles(targetWorkspaceId), refreshWorkspaces()]);
+      return fallbackBody;
     }
-    await refreshWorkspaces();
-    setSelectedWorkspaceId(body.id);
-    setWorkspaceFiles([]);
+    if (!response.ok) {
+      throw new Error(body.detail ?? "创建文件夹失败");
+    }
+    await Promise.all([refreshWorkspaceFiles(targetWorkspaceId), refreshWorkspaces()]);
     return body;
   }
 
-  async function switchWorkspace(workspace) {
-    if (!workspace?.id || running) {
-      return;
+  async function uploadWorkspaceFiles(fileList, targetPath = "") {
+    const files = Array.from(fileList ?? []);
+    const targetWorkspaceId = workspaceId;
+    if (!targetWorkspaceId || files.length === 0) {
+      return null;
     }
-    const nextAuth = { ...auth, workspace };
-    saveStoredAuth(nextAuth);
-    setAuth(nextAuth);
-    setSelectedWorkspaceId(workspace.id);
-    sourceRef.current?.close();
-    activeAssistantIdRef.current = null;
-    currentRunIdRef.current = null;
-    cancelRequestedRef.current = false;
-    setConversationId(null);
-    setMessages([]);
-    setUsagePanel(null);
-    setStatus("就绪");
-    setView("chat");
+    const formData = new FormData();
+    formData.set("target_path", targetPath);
+    for (const file of files) {
+      formData.append("files", file);
+    }
+    const response = await apiFetch(`/api/workspaces/${encodeURIComponent(targetWorkspaceId)}/upload`, {
+      method: "POST",
+      body: formData,
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(body.detail ?? "上传文件失败");
+    }
+    await Promise.all([refreshWorkspaceFiles(targetWorkspaceId), refreshWorkspaces()]);
+    return body;
+  }
+
+  async function copyWorkspaceEntry(sourcePath, targetPath) {
+    const targetWorkspaceId = workspaceId;
+    if (!targetWorkspaceId) {
+      throw new Error("工作空间不可用");
+    }
+    const response = await apiFetch(`/api/workspaces/${encodeURIComponent(targetWorkspaceId)}/copy`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source_path: sourcePath, target_path: targetPath }),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(body.detail ?? "复制失败");
+    }
+    await Promise.all([refreshWorkspaceFiles(targetWorkspaceId), refreshWorkspaces()]);
+    return body;
+  }
+
+  async function moveWorkspaceEntry(sourcePath, targetPath) {
+    const targetWorkspaceId = workspaceId;
+    if (!targetWorkspaceId) {
+      throw new Error("工作空间不可用");
+    }
+    const response = await apiFetch(`/api/workspaces/${encodeURIComponent(targetWorkspaceId)}/move`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source_path: sourcePath, target_path: targetPath }),
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(body.detail ?? "剪切失败");
+    }
+    await Promise.all([refreshWorkspaceFiles(targetWorkspaceId), refreshWorkspaces()]);
+    return body;
+  }
+
+  function openWorkspaceTree() {
+    setWorkspaceTreeOpen(true);
+    if (workspaceId) {
+      refreshWorkspaceFiles(workspaceId).catch((error) => setWorkspaceError(error.message));
+    }
   }
 
   async function createConversation(initialMessage) {
@@ -444,7 +516,7 @@ function App() {
       setUsagePanel((current) => usagePanelFromEstimate(event.payload, current));
     } else if (event.type === "model.usage") {
       setUsagePanel((current) => usagePanelFromModelUsage(event.payload, current));
-    } else if (event.type.startsWith("tool.call.")) {
+    } else if (event.type.startsWith("tool.call.") || event.type.startsWith("codex.") || event.type === "workspace.version.created" || event.type === "artifact.preview") {
       updateTool(assistantId, event);
     } else if (event.type === "run.completed") {
       updateAssistant(assistantId, { streaming: false });
@@ -537,7 +609,11 @@ function App() {
     setUsagePanel((current) => usagePanelFromSummary(body, current));
   }
 
-  const activeTitle = view === "workspaces" ? "工作空间管理" : displayActiveTitle(conversations, conversationId);
+  const activeTitle = view === "workspaces"
+    ? "工作空间"
+    : view === "history"
+      ? "聊天记录"
+      : displayActiveTitle(conversations, conversationId);
   const hasMessages = messages.length > 0;
 
   return h("div", { className: `app-frame${sidebarOpen ? "" : " sidebar-collapsed"}` },
@@ -552,6 +628,7 @@ function App() {
       onToggle: () => setSidebarOpen((value) => !value),
       onNewChat: startNewChat,
       onSelect: selectConversation,
+      onShowAllHistory: () => setView("history"),
       onWorkspaceManage: () => setView("workspaces"),
       onLogout: logout,
     }),
@@ -564,29 +641,42 @@ function App() {
       }, h(Icon, { name: "panel-left-open" })) : null,
       h(Header, {
         title: activeTitle,
-        status: view === "workspaces" ? workspaceStatus(workspaces, workspaceId) : status,
-        usage: view === "workspaces" ? null : usagePanel,
+        status: view === "workspaces"
+          ? workspaceStatus(workspaces, workspaceId)
+          : view === "history"
+            ? `${formatNumber(conversations.length)} 个会话`
+            : status,
+        usage: view === "chat" ? usagePanel : null,
         modelCatalog,
         showWorkspaceAction: view !== "workspaces",
         onWorkspaceManage: () => setView("workspaces"),
+        showWorkspaceTreeAction: view === "chat",
+        onWorkspaceTree: openWorkspaceTree,
       }),
       view === "workspaces"
         ? h(WorkspaceManager, {
-          workspaces,
           files: workspaceFiles,
-          currentWorkspaceId: workspaceId,
-          selectedWorkspaceId,
+          folders: workspaceFolders,
+          workspaceId,
           loading: workspaceLoading,
           filesLoading: workspaceFilesLoading,
           error: workspaceError,
-          running,
           onBack: () => setView("chat"),
-          onCreate: createWorkspace,
-          onSelect: setSelectedWorkspaceId,
-          onUse: switchWorkspace,
           onRefresh: refreshWorkspaces,
-          onRefreshFiles: () => refreshWorkspaceFiles(selectedWorkspaceId),
+          onRefreshFiles: () => refreshWorkspaceFiles(workspaceId),
+          onCreateFolder: createWorkspaceFolder,
+          onUploadFiles: uploadWorkspaceFiles,
+          onCopyEntry: copyWorkspaceEntry,
+          onMoveEntry: moveWorkspaceEntry,
         })
+        : view === "history"
+          ? h(ConversationHistoryPage, {
+            conversations,
+            activeId: conversationId,
+            running,
+            onBack: () => setView("chat"),
+            onSelect: selectConversation,
+          })
         : [
           h("section", { key: "messages", className: `message-scroll${hasMessages ? "" : " empty"}`, ref: messagesRef, "aria-live": "polite" },
             h("div", { className: "message-column" },
@@ -637,6 +727,15 @@ function App() {
             )
           )
         ]
+      ,
+      workspaceTreeOpen ? h(WorkspaceTreeDrawer, {
+        files: workspaceFiles,
+        folders: workspaceFolders,
+        loading: workspaceFilesLoading,
+        error: workspaceError,
+        onRefresh: () => refreshWorkspaceFiles(workspaceId),
+        onClose: () => setWorkspaceTreeOpen(false),
+      }) : null
     )
   );
 
@@ -661,8 +760,8 @@ function App() {
       };
       const next = {
         ...current,
-        name: event.payload?.name ?? current.name,
-        status: event.status ?? event.type.replace("tool.call.", ""),
+        name: event.payload?.name ?? displayEventName(event.type, current.name),
+        status: event.status ?? statusFromEventType(event.type),
         detail: toolDetail(current.detail, event),
       };
       if (existingIndex >= 0) {
@@ -884,9 +983,13 @@ function Sidebar({
   onToggle,
   onNewChat,
   onSelect,
+  onShowAllHistory,
   onWorkspaceManage,
   onLogout,
 }) {
+  const visibleConversations = conversations.slice(0, sidebarHistoryLimit);
+  const hasMoreConversations = conversations.length > sidebarHistoryLimit;
+
   return h("aside", { className: `sidebar${isOpen ? "" : " is-closed"}` },
     h("div", { className: "brand-row" },
       h(WcxLogo),
@@ -906,15 +1009,15 @@ function Sidebar({
     },
       h(Icon, { name: "folder", className: "workspace-nav-icon" }),
       h("span", { className: "workspace-nav-copy" },
-        h("strong", null, workspace?.name ?? "Default Workspace"),
-        h("span", null, "工作空间管理")
+        h("strong", null, "工作空间"),
+        h("span", null, "文件管理")
       )
     ),
     h("div", { className: "history-title" }, "历史会话"),
     h("nav", { className: "history-list" },
       conversations.length === 0
         ? h("p", { className: "history-empty" }, "暂无会话")
-        : conversations.map((conversation) => h("button", {
+        : visibleConversations.map((conversation) => h("button", {
           key: conversation.id,
           type: "button",
           className: "history-item",
@@ -924,7 +1027,15 @@ function Sidebar({
         },
           h("span", { className: "history-name" }, displayConversationTitle(conversation)),
           h("span", { className: "history-meta" }, formatConversationMeta(conversation))
-        ))
+        )),
+      hasMoreConversations ? h("button", {
+        className: "history-more-button",
+        type: "button",
+        onClick: onShowAllHistory,
+      },
+        h("span", null, "查看更多"),
+        h("span", null, `${formatNumber(conversations.length)} 条`)
+      ) : null
     ),
     h("div", { className: "account-box" },
       h("div", { className: "account-avatar" }, userInitial(user)),
@@ -937,47 +1048,181 @@ function Sidebar({
   );
 }
 
+function ConversationHistoryPage({
+  conversations,
+  activeId,
+  running,
+  onBack,
+  onSelect,
+}) {
+  return h("section", { className: "conversation-history-page" },
+    h("div", { className: "conversation-history-head" },
+      h("button", { className: "workspace-back-button", type: "button", onClick: onBack },
+        h(Icon, { name: "arrow-left" }),
+        "返回聊天"
+      ),
+      h("div", { className: "conversation-history-title" },
+        h("h2", null, "聊天记录"),
+        h("p", null, `${formatNumber(conversations.length)} 个历史会话`)
+      )
+    ),
+    conversations.length === 0
+      ? h("div", { className: "conversation-history-empty" }, "暂无会话")
+      : h("div", { className: "conversation-history-list" },
+        conversations.map((conversation) => h("button", {
+          key: conversation.id,
+          type: "button",
+          className: "conversation-history-item",
+          "aria-current": conversation.id === activeId ? "true" : "false",
+          disabled: running,
+          onClick: () => onSelect(conversation.id),
+        },
+          h("span", { className: "conversation-history-name" }, displayConversationTitle(conversation)),
+          h("span", { className: "conversation-history-meta" }, formatConversationMeta(conversation))
+        ))
+      )
+  );
+}
+
 function WorkspaceManager({
-  workspaces,
   files,
-  currentWorkspaceId,
-  selectedWorkspaceId,
+  folders,
+  workspaceId,
   loading,
   filesLoading,
   error,
-  running,
   onBack,
-  onCreate,
-  onSelect,
-  onUse,
   onRefresh,
   onRefreshFiles,
+  onCreateFolder,
+  onUploadFiles,
+  onCopyEntry,
+  onMoveEntry,
 }) {
-  const [name, setName] = useState("");
+  const uploadInputRef = useRef(null);
+  const [selectedPath, setSelectedPath] = useState("");
+  const [clipboard, setClipboard] = useState(null);
+  const [contextMenu, setContextMenu] = useState(null);
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState("");
-  const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceId) ?? workspaces[0] ?? null;
-  const fileTree = useMemo(() => buildFileTree(files), [files]);
+  const fileTree = useMemo(() => buildFileTree(files, folders), [files, folders]);
+  const selectedEntry = selectedPath ? findTreeNode(fileTree, selectedPath) : null;
+  const targetFolder = selectedEntry?.type === "folder" ? selectedEntry.path : selectedEntry ? parentPath(selectedEntry.path) : "";
   const totalSize = files.reduce((sum, file) => sum + numeric(file.size), 0);
   const folderCount = countFolders(fileTree);
 
-  async function submit(event) {
-    event.preventDefault();
-    const trimmed = name.trim();
+  async function refreshAll() {
+    setLocalError("");
+    try {
+      await Promise.all([onRefresh?.(), onRefreshFiles?.()]);
+    } catch (refreshError) {
+      setLocalError(refreshError.message);
+    }
+  }
+
+  async function createFolderIn(targetPath) {
+    const name = window.prompt("文件夹名称");
+    const trimmed = name?.trim();
     if (!trimmed || busy) {
       return;
     }
     setBusy(true);
     setLocalError("");
     try {
-      await onCreate(trimmed);
-      setName("");
-    } catch (createError) {
-      setLocalError(createError.message);
+      const path = joinPath(targetPath, trimmed);
+      await onCreateFolder(path);
+      setSelectedPath(path);
+    } catch (folderError) {
+      setLocalError(folderError.message);
     } finally {
+      setContextMenu(null);
       setBusy(false);
     }
   }
+
+  async function uploadSelectedFiles(event) {
+    const selectedFiles = event.target.files;
+    if (!selectedFiles?.length || busy) {
+      return;
+    }
+    setBusy(true);
+    setLocalError("");
+    try {
+      await onUploadFiles(selectedFiles, targetFolder);
+    } catch (uploadError) {
+      setLocalError(uploadError.message);
+    } finally {
+      event.target.value = "";
+      setBusy(false);
+    }
+  }
+
+  function chooseClipboard(mode) {
+    const node = contextMenu?.node ?? selectedEntry;
+    if (node) {
+      setClipboard({ mode, path: node.path, type: node.type });
+      setSelectedPath(node.path);
+    }
+    setContextMenu(null);
+  }
+
+  async function pasteClipboard(targetPath = targetFolder) {
+    if (!clipboard || busy) {
+      return;
+    }
+    const nextPath = joinPath(targetPath, baseName(clipboard.path));
+    setBusy(true);
+    setLocalError("");
+    try {
+      if (clipboard.mode === "cut") {
+        await onMoveEntry(clipboard.path, nextPath);
+        setClipboard(null);
+      } else {
+        await onCopyEntry(clipboard.path, nextPath);
+      }
+      setSelectedPath(nextPath);
+    } catch (pasteError) {
+      setLocalError(pasteError.message);
+    } finally {
+      setContextMenu(null);
+      setBusy(false);
+    }
+  }
+
+  async function copySelectedPath(node = selectedEntry) {
+    if (!node) {
+      return;
+    }
+    try {
+      await copyText(node.path);
+    } catch (copyError) {
+      setLocalError(copyError.message);
+    } finally {
+      setContextMenu(null);
+    }
+  }
+
+  function openContextMenu(event, node = null) {
+    event.preventDefault();
+    setSelectedPath(node?.path ?? "");
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      node,
+    });
+  }
+
+  function closeContextMenu() {
+    setContextMenu(null);
+  }
+
+  const empty = files.length === 0 && folders.length === 0;
+  const targetLabel = targetFolder || "工作空间";
+  const contextTargetFolder = contextMenu?.node?.type === "folder"
+    ? contextMenu.node.path
+    : contextMenu?.node
+      ? parentPath(contextMenu.node.path)
+      : "";
 
   return h("section", { className: "workspace-manager" },
     h("div", { className: "workspace-manager-head" },
@@ -986,106 +1231,194 @@ function WorkspaceManager({
         "返回聊天"
       ),
       h("div", { className: "workspace-manager-title" },
-        h("h2", null, "用户工作空间"),
-        h("p", null, "文件夹由 workspace 文件路径推导，例如 src/main.js 会显示为 src 文件夹；空文件夹目前没有独立持久化模型。")
+        h("h2", null, "工作空间")
       ),
-      h("button", { className: "workspace-refresh-button", type: "button", disabled: loading, onClick: onRefresh, title: "刷新工作空间" },
+      h("button", { className: "workspace-refresh-button", type: "button", disabled: loading || filesLoading || busy, onClick: refreshAll, title: "刷新" },
         h(Icon, { name: "refresh" }),
-        loading ? "刷新中" : "刷新"
+        loading || filesLoading ? "刷新中" : "刷新"
       )
     ),
     error || localError ? h("div", { className: "workspace-error" }, localError || error) : null,
-    h("div", { className: "workspace-grid" },
-      h("section", { className: "workspace-list-panel" },
-        h("div", { className: "workspace-section-head" },
-          h("h3", null, "工作空间"),
-          h("span", null, `${workspaces.length} 个`)
-        ),
-        h("form", { className: "workspace-create-form", onSubmit: submit },
-          h("input", {
-            value: name,
-            maxLength: 80,
-            placeholder: "新工作空间名称",
-            disabled: busy,
-            onChange: (event) => setName(event.target.value),
-          }),
-          h("button", { type: "submit", disabled: busy || !name.trim() },
-            busy ? "创建中" : "创建"
-          )
-        ),
-        h("div", { className: "workspace-list" },
-          loading && workspaces.length === 0
-            ? h("p", { className: "workspace-muted" }, "正在加载工作空间")
-            : workspaces.map((workspace) => h("button", {
-              key: workspace.id,
-              className: "workspace-list-item",
-              type: "button",
-              "aria-current": workspace.id === selectedWorkspace?.id ? "true" : "false",
-              onClick: () => onSelect(workspace.id),
-            },
-              h("span", { className: "workspace-list-name" }, workspace.name),
-              h("span", { className: "workspace-list-meta" },
-                `${formatNumber(workspace.file_count)} 个文件 · ${formatNumber(workspace.conversation_count)} 个会话`
-              ),
-              workspace.id === currentWorkspaceId ? h("span", { className: "workspace-current-mark" },
-                h(Icon, { name: "check" }),
-                "当前"
-              ) : null
-            ))
+    h("div", { className: "workspace-file-manager", onClick: closeContextMenu, onContextMenu: (event) => openContextMenu(event, null) },
+      h("div", { className: "workspace-toolbar" },
+        h("input", {
+          ref: uploadInputRef,
+          className: "workspace-hidden-input",
+          type: "file",
+          multiple: true,
+          onChange: uploadSelectedFiles,
+        }),
+        h("button", { className: "workspace-refresh-button", type: "button", disabled: busy || !workspaceId, onClick: () => uploadInputRef.current?.click() },
+          h(Icon, { name: "upload" }),
+          "上传文件"
         )
       ),
+      h("div", { className: "workspace-file-meta" },
+        h("span", null, `位置：${targetLabel}`),
+        selectedEntry ? h("span", null, `已选：${selectedEntry.path}`) : h("span", null, "未选择文件或文件夹"),
+        clipboard ? h("span", null, `${clipboard.mode === "cut" ? "剪切" : "复制"}：${clipboard.path}`) : null
+      ),
+      h("div", { className: "workspace-stats" },
+        h("div", null, h("strong", null, formatNumber(files.length)), h("span", null, "文件")),
+        h("div", null, h("strong", null, formatNumber(folderCount)), h("span", null, "文件夹")),
+        h("div", null, h("strong", null, formatBytes(totalSize)), h("span", null, "总大小"))
+      ),
       h("section", { className: "workspace-detail-panel" },
-        selectedWorkspace ? h("div", { className: "workspace-detail-head" },
-          h("div", null,
-            h("h3", null, selectedWorkspace.name),
-            h("p", null, selectedWorkspace.id)
-          ),
-          h("div", { className: "workspace-actions" },
-            h("button", { className: "workspace-refresh-button", type: "button", disabled: filesLoading, onClick: onRefreshFiles },
-              h(Icon, { name: "refresh" }),
-              filesLoading ? "加载中" : "刷新文件"
-            ),
-            h("button", {
-              className: "workspace-use-button",
-              type: "button",
-              disabled: running || selectedWorkspace.id === currentWorkspaceId,
-              onClick: () => onUse(selectedWorkspace),
-            }, selectedWorkspace.id === currentWorkspaceId ? "正在使用" : "切换到此工作空间")
-          )
-        ) : null,
-        selectedWorkspace ? h("div", { className: "workspace-stats" },
-          h("div", null, h("strong", null, formatNumber(files.length)), h("span", null, "文件")),
-          h("div", null, h("strong", null, formatNumber(folderCount)), h("span", null, "文件夹")),
-          h("div", null, h("strong", null, formatBytes(totalSize)), h("span", null, "总大小")),
-          h("div", null, h("strong", null, shortTime(selectedWorkspace.updated_at) || "-"), h("span", null, "更新时间"))
-        ) : null,
         h("div", { className: "workspace-tree-head" },
-          h("h3", null, "文件树"),
-          h("span", null, filesLoading ? "加载中" : `${files.length} 个文件`)
+          h("h3", null, "文件和文件夹"),
+          h("span", null, filesLoading ? "加载中" : `${formatNumber(files.length)} 个文件`)
         ),
-        filesLoading && files.length === 0
+        filesLoading && empty
           ? h("p", { className: "workspace-muted" }, "正在加载文件")
-          : files.length === 0
+          : empty
             ? h("div", { className: "workspace-empty-files" },
               h(Icon, { name: "folder" }),
               h("strong", null, "暂无文件"),
-              h("span", null, "Agent 写入文件后，这里会按路径显示目录结构。")
+              h("span", null, "可以新建文件夹或上传文件。")
             )
-            : h(FileTree, { nodes: fileTree })
-      )
+            : h(FileTree, {
+              nodes: fileTree,
+              selectedPath,
+              onSelect: (node) => setSelectedPath(node.path),
+              onContextMenu: openContextMenu,
+            })
+      ),
+      contextMenu ? h(WorkspaceContextMenu, {
+        x: contextMenu.x,
+        y: contextMenu.y,
+        node: contextMenu.node,
+        clipboard,
+        busy,
+        onCreateFolder: () => createFolderIn(contextTargetFolder),
+        onUpload: () => {
+          closeContextMenu();
+          uploadInputRef.current?.click();
+        },
+        onCopy: () => chooseClipboard("copy"),
+        onCut: () => chooseClipboard("cut"),
+        onPaste: () => pasteClipboard(contextTargetFolder),
+        onCopyPath: () => copySelectedPath(contextMenu.node),
+      }) : null
     )
   );
 }
 
-function FileTree({ nodes, depth = 0 }) {
+function WorkspaceContextMenu({
+  x,
+  y,
+  node,
+  clipboard,
+  busy,
+  onCreateFolder,
+  onUpload,
+  onCopy,
+  onCut,
+  onPaste,
+  onCopyPath,
+}) {
+  return h("div", {
+    className: "workspace-context-menu",
+    style: { left: x, top: y },
+    onClick: (event) => event.stopPropagation(),
+    onContextMenu: (event) => event.preventDefault(),
+  },
+    h("button", { type: "button", disabled: busy, onClick: onCreateFolder },
+      h(Icon, { name: "folder-plus" }),
+      "新建文件夹"
+    ),
+    h("button", { type: "button", disabled: busy, onClick: onUpload },
+      h(Icon, { name: "upload" }),
+      "上传文件"
+    ),
+    node ? h("button", { type: "button", disabled: busy, onClick: onCopy },
+      h(Icon, { name: "copy" }),
+      "复制"
+    ) : null,
+    node ? h("button", { type: "button", disabled: busy, onClick: onCut },
+      h(Icon, { name: "scissors" }),
+      "剪切"
+    ) : null,
+    h("button", { type: "button", disabled: busy || !clipboard, onClick: onPaste },
+      h(Icon, { name: "clipboard" }),
+      "粘贴"
+    ),
+    node ? h("button", { type: "button", disabled: busy, onClick: onCopyPath },
+      h(Icon, { name: "link" }),
+      "复制路径"
+    ) : null
+  );
+}
+
+function WorkspaceTreeDrawer({ files, folders, loading, error, onRefresh, onClose }) {
+  const [localError, setLocalError] = useState("");
+  const fileTree = useMemo(() => buildFileTree(files, folders), [files, folders]);
+  const empty = files.length === 0 && folders.length === 0;
+
+  function copyPath(path) {
+    setLocalError("");
+    copyText(path).catch((copyError) => setLocalError(copyError.message));
+  }
+
+  return h("aside", { className: "workspace-tree-drawer" },
+    h("div", { className: "workspace-tree-drawer-head" },
+      h("h2", null, "工作空间"),
+      h("div", { className: "workspace-tree-drawer-actions" },
+        h("button", { className: "workspace-refresh-button", type: "button", disabled: loading, onClick: onRefresh, title: "刷新" },
+          h(Icon, { name: "refresh" })
+        ),
+        h("button", { className: "workspace-refresh-button", type: "button", onClick: onClose, title: "关闭" },
+          h(Icon, { name: "x" })
+        )
+      )
+    ),
+    error || localError ? h("div", { className: "workspace-error" }, localError || error) : null,
+    loading && empty
+      ? h("p", { className: "workspace-muted" }, "正在加载文件")
+      : empty
+        ? h("div", { className: "workspace-empty-files compact" },
+          h(Icon, { name: "folder" }),
+          h("strong", null, "暂无文件")
+        )
+        : h(FileTree, {
+          nodes: fileTree,
+          renderActions: (node) => h("button", {
+            className: "file-tree-action",
+            type: "button",
+            title: "复制路径",
+            onClick: () => copyPath(node.path),
+          }, h(Icon, { name: "link" })),
+        })
+  );
+}
+
+function FileTree({ nodes, depth = 0, selectedPath = "", onSelect, onContextMenu, renderActions }) {
   return h("div", { className: "file-tree", style: { "--tree-depth": depth } },
     nodes.map((node) => h("div", { key: node.path, className: "file-tree-node" },
-      h("div", { className: `file-tree-row ${node.type}` },
+      h("div", {
+        className: `file-tree-row ${node.type}${node.path === selectedPath ? " is-selected" : ""}`,
+        role: onSelect ? "button" : undefined,
+        tabIndex: onSelect ? 0 : undefined,
+        onClick: onSelect ? () => onSelect(node) : undefined,
+        onContextMenu: onContextMenu ? (event) => {
+          event.stopPropagation();
+          onContextMenu(event, node);
+        } : undefined,
+        onKeyDown: onSelect ? (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onSelect(node);
+          }
+        } : undefined,
+      },
         h(Icon, { name: node.type === "folder" ? "folder" : "file" }),
         h("span", { className: "file-tree-name", title: node.path }, node.name),
-        node.type === "file" ? h("span", { className: "file-tree-size" }, formatBytes(node.size)) : null
+        node.type === "file" ? h("span", { className: "file-tree-size" }, formatBytes(node.size)) : null,
+        renderActions ? h("div", {
+          className: "file-tree-actions",
+          onClick: (event) => event.stopPropagation(),
+        }, renderActions(node)) : null
       ),
-      node.children?.length ? h(FileTree, { nodes: node.children, depth: depth + 1 }) : null
+      node.children?.length ? h(FileTree, { nodes: node.children, depth: depth + 1, selectedPath, onSelect, onContextMenu, renderActions }) : null
     ))
   );
 }
@@ -1184,6 +1517,13 @@ function Icon({ name, className = "" }) {
       h("path", { d: "M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" })
     );
   }
+  if (name === "folder-plus") {
+    return h("svg", common,
+      h("path", { d: "M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7l-2-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" }),
+      h("path", { d: "M12 11v6" }),
+      h("path", { d: "M9 14h6" })
+    );
+  }
   if (name === "file") {
     return h("svg", common,
       h("path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" }),
@@ -1209,6 +1549,55 @@ function Icon({ name, className = "" }) {
       h("path", { d: "M20 6 9 17l-5-5" })
     );
   }
+  if (name === "upload") {
+    return h("svg", common,
+      h("path", { d: "M12 3v12" }),
+      h("path", { d: "M7 8l5-5 5 5" }),
+      h("path", { d: "M5 21h14" })
+    );
+  }
+  if (name === "copy") {
+    return h("svg", common,
+      h("rect", { width: "14", height: "14", x: "8", y: "8", rx: "2" }),
+      h("path", { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" })
+    );
+  }
+  if (name === "scissors") {
+    return h("svg", common,
+      h("circle", { cx: "6", cy: "7", r: "3" }),
+      h("circle", { cx: "6", cy: "17", r: "3" }),
+      h("path", { d: "M8.6 8.6 19 19" }),
+      h("path", { d: "M8.6 15.4 19 5" })
+    );
+  }
+  if (name === "clipboard") {
+    return h("svg", common,
+      h("rect", { width: "14", height: "18", x: "5", y: "4", rx: "2" }),
+      h("path", { d: "M9 4a3 3 0 0 1 6 0" }),
+      h("path", { d: "M9 4h6" })
+    );
+  }
+  if (name === "link") {
+    return h("svg", common,
+      h("path", { d: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" }),
+      h("path", { d: "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" })
+    );
+  }
+  if (name === "file-tree") {
+    return h("svg", common,
+      h("path", { d: "M4 4h6v6H4z" }),
+      h("path", { d: "M14 14h6v6h-6z" }),
+      h("path", { d: "M4 14h6v6H4z" }),
+      h("path", { d: "M10 7h2a2 2 0 0 1 2 2v8" }),
+      h("path", { d: "M10 17h4" })
+    );
+  }
+  if (name === "x") {
+    return h("svg", common,
+      h("path", { d: "M18 6 6 18" }),
+      h("path", { d: "m6 6 12 12" })
+    );
+  }
   if (name === "stop") {
     return h("svg", common,
       h("rect", { width: "10", height: "10", x: "7", y: "7", rx: "1", fill: "currentColor", stroke: "none" })
@@ -1220,18 +1609,36 @@ function Icon({ name, className = "" }) {
   );
 }
 
-function Header({ title, status, usage, modelCatalog, showWorkspaceAction = false, onWorkspaceManage }) {
+function Header({
+  title,
+  status,
+  usage,
+  modelCatalog,
+  showWorkspaceAction = false,
+  onWorkspaceManage,
+  showWorkspaceTreeAction = false,
+  onWorkspaceTree,
+}) {
   return h("header", { className: "topbar" },
     h("div", { className: "title-block" },
       h("h1", null, title),
       usage ? h(UsageMeterStable, { usage, modelCatalog }) : null
     ),
     h("div", { className: "runtime-strip" },
+      showWorkspaceTreeAction ? h("button", {
+        className: "topbar-workspace-button",
+        type: "button",
+        onClick: onWorkspaceTree,
+        title: "展开工作空间文件树",
+      },
+        h(Icon, { name: "file-tree" }),
+        "文件树"
+      ) : null,
       showWorkspaceAction ? h("button", {
         className: "topbar-workspace-button",
         type: "button",
         onClick: onWorkspaceManage,
-        title: "打开工作空间管理",
+        title: "打开工作空间",
       },
         h(Icon, { name: "folder" }),
         "工作空间"
@@ -1455,8 +1862,8 @@ function EmptyState({ workspace, onWorkspaceManage }) {
       onClick: onWorkspaceManage,
     },
       h(Icon, { name: "folder" }),
-      h("span", null, "工作空间管理"),
-      h("small", null, workspace?.name ?? "Default Workspace")
+      h("span", null, "工作空间"),
+      h("small", null, "文件和文件夹")
     )
   );
 }
@@ -1787,8 +2194,7 @@ function displayActiveTitle(conversations, activeId) {
 }
 
 function workspaceStatus(workspaces, currentWorkspaceId) {
-  const current = workspaces.find((workspace) => workspace.id === currentWorkspaceId);
-  return current ? `当前：${current.name}` : "工作空间";
+  return "工作空间";
 }
 
 function formatConversationMeta(conversation) {
@@ -1881,8 +2287,28 @@ function shortTime(value) {
   }).format(date);
 }
 
-function buildFileTree(files) {
+function buildFileTree(files, folders = []) {
   const root = new Map();
+  for (const folder of folders) {
+    const parts = String(folder.path ?? "").split("/").filter(Boolean);
+    let children = root;
+    let currentPath = "";
+    parts.forEach((part) => {
+      currentPath = currentPath ? `${currentPath}/${part}` : part;
+      if (!children.has(part)) {
+        children.set(part, {
+          name: part,
+          path: currentPath,
+          type: "folder",
+          size: 0,
+          children: new Map(),
+        });
+      }
+      const node = children.get(part);
+      node.type = "folder";
+      children = node.children;
+    });
+  }
   for (const file of files) {
     const parts = String(file.path ?? "").split("/").filter(Boolean);
     let children = root;
@@ -1908,6 +2334,83 @@ function buildFileTree(files) {
     });
   }
   return sortTreeNodes(root);
+}
+
+function normalizeWorkspaceEntries(files, folders) {
+  const folderPaths = new Set((folders ?? []).map((folder) => folder.path).filter(Boolean));
+  const visibleFiles = [];
+  for (const file of files ?? []) {
+    const path = String(file.path ?? "");
+    if (baseName(path) === folderMarkerFile) {
+      const folderPath = parentPath(path);
+      if (folderPath) {
+        folderPaths.add(folderPath);
+      }
+      continue;
+    }
+    visibleFiles.push(file);
+  }
+  return {
+    files: visibleFiles,
+    folders: [...folderPaths].sort((left, right) => left.localeCompare(right, "zh-CN")).map((path) => ({ path })),
+  };
+}
+
+function findTreeNode(nodes, path) {
+  for (const node of nodes) {
+    if (node.path === path) {
+      return node;
+    }
+    const child = findTreeNode(node.children ?? [], path);
+    if (child) {
+      return child;
+    }
+  }
+  return null;
+}
+
+function parentPath(path) {
+  const parts = String(path ?? "").split("/").filter(Boolean);
+  parts.pop();
+  return parts.join("/");
+}
+
+function baseName(path) {
+  const parts = String(path ?? "").split("/").filter(Boolean);
+  return parts.at(-1) ?? "";
+}
+
+function joinPath(folder, name) {
+  const left = String(folder ?? "").replace(/^\/+|\/+$/g, "");
+  const right = String(name ?? "").replace(/^\/+|\/+$/g, "");
+  return left ? `${left}/${right}` : right;
+}
+
+function encodeWorkspacePath(path) {
+  return String(path ?? "")
+    .split("/")
+    .filter(Boolean)
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const ok = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!ok) {
+    throw new Error("复制失败");
+  }
 }
 
 function sortTreeNodes(nodes) {
@@ -1984,6 +2487,31 @@ function toolBlocks(blocks) {
   return blocks.filter((block) => block.type === "tool");
 }
 
+function displayEventName(type, fallback) {
+  const labels = {
+    "codex.command.started": "shell",
+    "codex.command.completed": "shell",
+    "codex.patch.started": "apply_patch",
+    "codex.patch.completed": "apply_patch",
+    "workspace.version.created": "workspace_export",
+    "artifact.preview": "viewTool2",
+  };
+  return labels[type] ?? fallback ?? "工具调用";
+}
+
+function statusFromEventType(type) {
+  if (type.endsWith(".completed") || type === "workspace.version.created" || type === "artifact.preview") {
+    return "completed";
+  }
+  if (type.endsWith(".failed")) {
+    return "failed";
+  }
+  if (type.endsWith(".started") || type.endsWith(".delta")) {
+    return "running";
+  }
+  return type.replace("tool.call.", "");
+}
+
 function toolStatusLabel(status) {
   const labels = {
     running: "执行中",
@@ -2021,6 +2549,39 @@ function toolDetail(previous, event) {
   }
   if (event.type === "tool.call.failed") {
     return event.payload?.error ?? "工具执行失败";
+  }
+  if (event.type === "codex.command.started") {
+    return formatPayload({
+      command: event.payload?.command,
+      cwd: event.payload?.cwd,
+    });
+  }
+  if (event.type === "codex.command.completed") {
+    return formatPayload({
+      exitCode: event.payload?.exitCode,
+      timedOut: event.payload?.timedOut,
+      durationMs: event.payload?.durationMs,
+      stdout: event.payload?.stdout,
+      stderr: event.payload?.stderr,
+    });
+  }
+  if (event.type === "codex.patch.started") {
+    return formatPayload(event.payload?.operation ?? event.payload ?? {});
+  }
+  if (event.type === "codex.patch.completed") {
+    return formatPayload({
+      status: event.payload?.status,
+      output: event.payload?.output,
+    });
+  }
+  if (event.type === "workspace.version.created") {
+    return formatPayload({
+      versionId: event.payload?.versionId,
+      exported: event.payload?.exported,
+    });
+  }
+  if (event.type === "artifact.preview") {
+    return formatPayload(event.payload?.preview ?? event.payload ?? {});
   }
   return formatPayload(event.payload ?? {});
 }

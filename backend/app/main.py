@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import binascii
 import fnmatch
 import hashlib
 import hmac
@@ -21,7 +22,7 @@ from pathlib import PurePosixPath
 from typing import Literal
 
 import httpx
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -537,6 +538,21 @@ class WriteWorkspaceFileRequest(BaseModel):
     content_type: str = "text/plain; charset=utf-8"
 
 
+class WriteWorkspaceFileBytesRequest(BaseModel):
+    content_base64: str
+    message: str = "write file"
+    content_type: str = "application/octet-stream"
+
+
+class CreateWorkspaceFolderRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=500)
+
+
+class WorkspaceEntryOperationRequest(BaseModel):
+    source_path: str = Field(min_length=1, max_length=500)
+    target_path: str = Field(min_length=1, max_length=500)
+
+
 class UpdateAttachmentOpenAIFileRequest(BaseModel):
     openai_file_id: str | None = None
     openai_status: str = Field(pattern="^(pending|uploaded|failed|skipped)$")
@@ -554,6 +570,17 @@ class WorkspaceGrepRequest(BaseModel):
     path_glob: str | None = None
     case_sensitive: bool = True
     max_matches: int = Field(default=50, ge=1, le=200)
+
+
+class WorkspaceRgRequest(BaseModel):
+    pattern: str = Field(min_length=1)
+    path_glob: str | None = None
+    case_sensitive: bool = True
+    context_before: int = Field(default=0, ge=0, le=3)
+    context_after: int = Field(default=0, ge=0, le=3)
+    max_matches: int = Field(default=50, ge=1, le=200)
+    max_line_chars: int = Field(default=240, ge=40, le=1000)
+    cursor: str | None = None
 
 
 class WorkspaceSearchRequest(BaseModel):
@@ -704,7 +731,10 @@ def list_workspace_files(
 ) -> dict:
     require_workspace_owner(workspace_id, current_user)
     try:
-        return {"files": store.list_workspace_files(workspace_id=workspace_id, version_id=version_id)}
+        return {
+            "files": store.list_workspace_files(workspace_id=workspace_id, version_id=version_id),
+            "folders": store.list_workspace_folders(workspace_id=workspace_id, version_id=version_id),
+        }
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -720,6 +750,83 @@ def list_workspace_file_ops(
         return {"ops": store.list_file_ops(workspace_id=workspace_id, version_id=version_id)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/folders")
+def create_workspace_folder(
+    workspace_id: str,
+    body: CreateWorkspaceFolderRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
+    path = normalize_workspace_path(body.path)
+    try:
+        return {"folder": store.create_workspace_folder(workspace_id=workspace_id, path=path)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/upload")
+async def upload_workspace_files(
+    workspace_id: str,
+    target_path: str = Form(default=""),
+    files: list[UploadFile] = File(...),
+    current_user: dict = Depends(get_current_user),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
+    if not files:
+        raise HTTPException(status_code=400, detail="No files were uploaded")
+    target_folder = normalize_optional_workspace_folder(target_path)
+    uploaded = []
+    for file in files:
+        uploaded.append(
+            await store_workspace_upload(
+                workspace_id=workspace_id,
+                target_folder=target_folder,
+                file=file,
+                object_store=object_store,
+            )
+        )
+    return {"files": uploaded}
+
+
+@app.post("/api/workspaces/{workspace_id}/copy")
+def copy_workspace_entry(
+    workspace_id: str,
+    body: WorkspaceEntryOperationRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
+    source_path = normalize_workspace_path(body.source_path)
+    target_path = normalize_workspace_path(body.target_path)
+    try:
+        return store.copy_workspace_entry(
+            workspace_id=workspace_id,
+            source_path=source_path,
+            target_path=target_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/move")
+def move_workspace_entry(
+    workspace_id: str,
+    body: WorkspaceEntryOperationRequest,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_workspace_owner(workspace_id, current_user)
+    source_path = normalize_workspace_path(body.source_path)
+    target_path = normalize_workspace_path(body.target_path)
+    try:
+        return store.move_workspace_entry(
+            workspace_id=workspace_id,
+            source_path=source_path,
+            target_path=target_path,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/attachments")
@@ -782,9 +889,10 @@ def worker_list_workspace_files(
 ) -> dict:
     try:
         files = store.list_workspace_files(workspace_id=workspace_id, version_id=version_id)
+        folders = store.list_workspace_folders(workspace_id=workspace_id, version_id=version_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"workspace_id": workspace_id, "files": files}
+    return {"workspace_id": workspace_id, "files": files, "folders": folders}
 
 
 @app.get("/internal/workspaces/{workspace_id}/files/{file_path:path}")
@@ -803,6 +911,22 @@ def worker_read_workspace_file(
     )
 
 
+@app.get("/internal/workspaces/{workspace_id}/file-bytes/{file_path:path}")
+def worker_read_workspace_file_bytes(
+    workspace_id: str,
+    file_path: str,
+    version_id: str | None = None,
+    _authorized: None = Depends(require_worker_token),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    return read_workspace_file_bytes(
+        workspace_id=workspace_id,
+        file_path=file_path,
+        version_id=version_id,
+        object_store=object_store,
+    )
+
+
 @app.put("/internal/workspaces/{workspace_id}/files/{file_path:path}")
 def worker_write_workspace_file(
     workspace_id: str,
@@ -812,6 +936,22 @@ def worker_write_workspace_file(
     object_store: AliyunObjectStore = Depends(require_object_store),
 ) -> dict:
     return write_workspace_file_content(
+        workspace_id=workspace_id,
+        file_path=file_path,
+        body=body,
+        object_store=object_store,
+    )
+
+
+@app.put("/internal/workspaces/{workspace_id}/file-bytes/{file_path:path}")
+def worker_write_workspace_file_bytes(
+    workspace_id: str,
+    file_path: str,
+    body: WriteWorkspaceFileBytesRequest,
+    _authorized: None = Depends(require_worker_token),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    return write_workspace_file_bytes(
         workspace_id=workspace_id,
         file_path=file_path,
         body=body,
@@ -850,6 +990,65 @@ def worker_grep_workspace(
                 return {"workspace_id": workspace_id, "matches": matches, "truncated": True}
 
     return {"workspace_id": workspace_id, "matches": matches, "truncated": False}
+
+
+@app.post("/internal/workspaces/{workspace_id}/rg")
+def worker_rg_workspace(
+    workspace_id: str,
+    body: WorkspaceRgRequest,
+    _authorized: None = Depends(require_worker_token),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> dict:
+    try:
+        pattern = re.compile(body.pattern, 0 if body.case_sensitive else re.IGNORECASE)
+    except re.error as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid rg pattern: {exc}") from exc
+
+    all_matches = []
+    for file_record, content in iter_workspace_text_files(workspace_id, body.path_glob, object_store):
+        lines = content.splitlines()
+        for line_index, line in enumerate(lines):
+            match = pattern.search(line)
+            if not match:
+                continue
+            before_start = max(0, line_index - body.context_before)
+            after_end = min(len(lines), line_index + body.context_after + 1)
+            all_matches.append(
+                {
+                    "path": file_record["path"],
+                    "line": line_index + 1,
+                    "text": truncate_text(line, body.max_line_chars),
+                    "before": [
+                        truncate_text(item, body.max_line_chars)
+                        for item in lines[before_start:line_index]
+                    ] or None,
+                    "after": [
+                        truncate_text(item, body.max_line_chars)
+                        for item in lines[line_index + 1 : after_end]
+                    ] or None,
+                }
+            )
+
+    start = decode_int_cursor(body.cursor)
+    matches = []
+    total_chars = 0
+    max_response_chars = 32 * 1024
+    for item in all_matches[start:]:
+        item_chars = len(json.dumps(item, ensure_ascii=False))
+        if len(matches) >= body.max_matches or (matches and total_chars + item_chars > max_response_chars):
+            break
+        matches.append({key: value for key, value in item.items() if value is not None})
+        total_chars += item_chars
+
+    next_index = start + len(matches)
+    truncated = next_index < len(all_matches)
+    return {
+        "ok": True,
+        "workspace_id": workspace_id,
+        "matches": matches,
+        "next_cursor": encode_int_cursor(next_index) if truncated else None,
+        "truncated": truncated,
+    }
 
 
 @app.post("/internal/workspaces/{workspace_id}/search")
@@ -921,6 +1120,31 @@ def read_workspace_file_content(
     return {"file": file_record, "content": content}
 
 
+def read_workspace_file_bytes(
+    workspace_id: str,
+    file_path: str,
+    version_id: str | None,
+    object_store: AliyunObjectStore,
+) -> dict:
+    path = normalize_workspace_path(file_path)
+    try:
+        file_record = store.get_workspace_file(workspace_id=workspace_id, path=path, version_id=version_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    try:
+        data = object_store.read_bytes(file_record["blob_key"])
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail="Blob is missing from Aliyun OSS") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "file": file_record,
+        "content_base64": base64.b64encode(data).decode("ascii"),
+    }
+
+
 @app.put("/api/workspaces/{workspace_id}/files/{file_path:path}")
 def write_workspace_file(
     workspace_id: str,
@@ -961,6 +1185,66 @@ def write_workspace_file_content(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"file": file_record, "blob": blob}
+
+
+def write_workspace_file_bytes(
+    workspace_id: str,
+    file_path: str,
+    body: WriteWorkspaceFileBytesRequest,
+    object_store: AliyunObjectStore,
+) -> dict:
+    path = normalize_workspace_path(file_path)
+    if not store.get_workspace(workspace_id):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    try:
+        data = base64.b64decode(body.content_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=400, detail="Invalid base64 content") from exc
+    blob = object_store.put_bytes(data, content_type=body.content_type)
+    try:
+        file_record = store.write_workspace_file(
+            workspace_id=workspace_id,
+            path=path,
+            blob_key=blob["key"],
+            blob_sha256=blob["sha256"],
+            size=blob["size"],
+            content_type=body.content_type,
+            message=body.message,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"file": file_record, "blob": blob}
+
+
+async def store_workspace_upload(
+    *,
+    workspace_id: str,
+    target_folder: str,
+    file: UploadFile,
+    object_store: AliyunObjectStore,
+) -> dict:
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail=f"Uploaded file is empty: {file.filename or 'unnamed'}")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=400, detail=f"Uploaded file is too large: {file.filename or 'unnamed'}")
+
+    safe_name = safe_filename(file.filename or "upload")
+    content_type = detect_content_type(data, safe_name, file.content_type)
+    workspace_path = f"{target_folder}/{safe_name}" if target_folder else safe_name
+    blob = object_store.put_bytes(data, content_type=content_type)
+    try:
+        return store.write_workspace_file(
+            workspace_id=workspace_id,
+            path=workspace_path,
+            blob_key=blob["key"],
+            blob_sha256=blob["sha256"],
+            size=blob["size"],
+            content_type=content_type,
+            message=f"upload file {workspace_path}",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/conversations", response_model=CreateConversationResponse)
@@ -1525,7 +1809,12 @@ async def start_node_worker(
     store.set_run_status(run_id, "running")
     worker_entry = settings.worker_entry_path
     sandbox_dir = settings.worker_sandbox_root_path / run_id
+    run_dir = settings.worker_runs_root_path / run_id
+    run_workspace_dir = run_dir / "workspace"
+    run_artifacts_dir = run_dir / "artifacts"
     sandbox_dir.mkdir(parents=True, exist_ok=True)
+    run_workspace_dir.mkdir(parents=True, exist_ok=True)
+    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
     if not worker_entry.exists():
         store.append_event(
             run_id,
@@ -1547,6 +1836,16 @@ async def start_node_worker(
             "CONVERSATION_ID": conversation_id,
             "WORKSPACE_ID": workspace_id,
             "SANDBOX_DIR": str(sandbox_dir),
+            "RUN_WORKSPACE_DIR": str(run_workspace_dir),
+            "RUN_ARTIFACTS_DIR": str(run_artifacts_dir),
+            "WORKER_RUNTIME": settings.worker_runtime,
+            "WORKER_DOCKER_IMAGE": settings.worker_docker_image,
+            "WORKER_DOCKER_AUTO_BUILD": str(settings.worker_docker_auto_build).lower(),
+            "WORKER_DOCKER_NETWORK": settings.worker_docker_network,
+            "WORKER_DOCKER_CPUS": settings.worker_docker_cpus,
+            "WORKER_DOCKER_MEMORY": settings.worker_docker_memory,
+            "WORKER_DOCKER_PIDS_LIMIT": settings.worker_docker_pids_limit,
+            "WORKER_KEEP_CONTAINER": str(settings.worker_keep_container).lower(),
             "OPENAI_MODEL": run_settings.model,
             "OPENAI_REASONING_EFFORT": run_settings.reasoning_effort,
             "OPENAI_REASONING_SUMMARY": run_settings.reasoning_summary,
@@ -1715,6 +2014,27 @@ def snippet_around(content: str, index: int, radius: int = 80) -> str:
     return f"{prefix}{snippet}{suffix}"
 
 
+def truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}[line truncated]"
+
+
+def decode_int_cursor(cursor: str | None) -> int:
+    if not cursor:
+        return 0
+    try:
+        value = base64.urlsafe_b64decode(cursor.encode("ascii") + b"===").decode("utf-8")
+        number = int(value)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return 0
+    return max(number, 0)
+
+
+def encode_int_cursor(value: int) -> str:
+    return base64.urlsafe_b64encode(str(value).encode("utf-8")).decode("ascii").rstrip("=")
+
+
 def normalize_workspace_path(file_path: str) -> str:
     raw_path = file_path.replace("\\", "/").strip()
     path = PurePosixPath(raw_path)
@@ -1724,3 +2044,10 @@ def normalize_workspace_path(file_path: str) -> str:
     if normalized in {".", ""}:
         raise HTTPException(status_code=400, detail="Invalid workspace file path")
     return normalized
+
+
+def normalize_optional_workspace_folder(folder_path: str | None) -> str:
+    raw_path = (folder_path or "").replace("\\", "/").strip().strip("/")
+    if not raw_path:
+        return ""
+    return normalize_workspace_path(raw_path)

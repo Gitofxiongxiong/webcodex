@@ -81,6 +81,17 @@ class DemoStore:
                     FOREIGN KEY(version_id) REFERENCES workspace_versions(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS workspace_folders (
+                    workspace_id TEXT NOT NULL,
+                    version_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY(workspace_id, version_id, path),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(id),
+                    FOREIGN KEY(version_id) REFERENCES workspace_versions(id)
+                );
+
                 CREATE TABLE IF NOT EXISTS file_ops (
                     id TEXT PRIMARY KEY,
                     workspace_id TEXT NOT NULL,
@@ -246,6 +257,9 @@ class DemoStore:
 
                 CREATE INDEX IF NOT EXISTS idx_workspace_files_current
                     ON workspace_files(workspace_id, version_id, path);
+
+                CREATE INDEX IF NOT EXISTS idx_workspace_folders_current
+                    ON workspace_folders(workspace_id, version_id, path);
 
                 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user
                     ON auth_sessions(user_id, expires_at);
@@ -511,6 +525,23 @@ class DemoStore:
             file_record["version_id"] = resolved_version_id
         return files
 
+    def list_workspace_folders(self, workspace_id: str, version_id: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            resolved_version_id = self._resolve_version_id(conn, workspace_id, version_id)
+            rows = conn.execute(
+                """
+                SELECT path, updated_at
+                FROM workspace_folders
+                WHERE workspace_id = ? AND version_id = ? AND deleted = 0
+                ORDER BY path
+                """,
+                (workspace_id, resolved_version_id),
+            ).fetchall()
+        folders = [dict(row) for row in rows]
+        for folder_record in folders:
+            folder_record["version_id"] = resolved_version_id
+        return folders
+
     def get_workspace_file(
         self,
         workspace_id: str,
@@ -545,25 +576,11 @@ class DemoStore:
     ) -> dict[str, Any]:
         with self._lock, self.connect() as conn:
             parent_version_id = self._resolve_version_id(conn, workspace_id, None)
-            version_id = f"ver_{uuid.uuid4().hex}"
-            conn.execute(
-                """
-                INSERT INTO workspace_versions(id, workspace_id, parent_version_id, message)
-                VALUES (?, ?, ?, ?)
-                """,
-                (version_id, workspace_id, parent_version_id, message),
-            )
-            conn.execute(
-                """
-                INSERT INTO workspace_files(
-                    workspace_id, version_id, path, blob_key, blob_sha256, size, content_type, deleted, updated_at
-                )
-                SELECT workspace_id, ?, path, blob_key, blob_sha256, size, content_type, deleted, datetime('now')
-                FROM workspace_files
-                WHERE workspace_id = ? AND version_id = ? AND deleted = 0
-                """,
-                (version_id, workspace_id, parent_version_id),
-            )
+            if self._workspace_file_ancestor_exists(conn, workspace_id, parent_version_id, path):
+                raise ValueError("A parent path is already a file")
+            if self._workspace_folder_exists(conn, workspace_id, parent_version_id, path):
+                raise ValueError("A folder already exists at that path")
+            version_id = self._create_workspace_snapshot(conn, workspace_id, parent_version_id, message)
             existing = conn.execute(
                 """
                 SELECT 1
@@ -589,6 +606,7 @@ class DemoStore:
                 """,
                 (workspace_id, version_id, path, blob_key, blob_sha256, size, content_type),
             )
+            self._insert_parent_folders(conn, workspace_id, version_id, path)
             conn.execute(
                 """
                 INSERT INTO file_ops(id, workspace_id, version_id, op, path, blob_sha256)
@@ -616,6 +634,142 @@ class DemoStore:
         file_record["version_id"] = version_id
         file_record["op"] = op
         return file_record
+
+    def create_workspace_folder(self, workspace_id: str, path: str, message: str = "create folder") -> dict[str, Any]:
+        with self._lock, self.connect() as conn:
+            parent_version_id = self._resolve_version_id(conn, workspace_id, None)
+            if self._workspace_file_ancestor_exists(conn, workspace_id, parent_version_id, path):
+                raise ValueError("A parent path is already a file")
+            if self._workspace_file_exists(conn, workspace_id, parent_version_id, path):
+                raise ValueError("A file already exists at that path")
+            version_id = self._create_workspace_snapshot(conn, workspace_id, parent_version_id, message)
+            self._insert_parent_folders(conn, workspace_id, version_id, f"{path}/.keep")
+            self._insert_workspace_folder(conn, workspace_id, version_id, path)
+            conn.execute(
+                """
+                INSERT INTO file_ops(id, workspace_id, version_id, op, path)
+                VALUES (?, ?, ?, 'folder.created', ?)
+                """,
+                (f"fop_{uuid.uuid4().hex}", workspace_id, version_id, path),
+            )
+            self._set_workspace_version(conn, workspace_id, version_id)
+            row = conn.execute(
+                """
+                SELECT path, updated_at
+                FROM workspace_folders
+                WHERE workspace_id = ? AND version_id = ? AND path = ? AND deleted = 0
+                """,
+                (workspace_id, version_id, path),
+            ).fetchone()
+        folder_record = dict(row)
+        folder_record["version_id"] = version_id
+        return folder_record
+
+    def copy_workspace_entry(
+        self,
+        workspace_id: str,
+        source_path: str,
+        target_path: str,
+        message: str = "copy entry",
+    ) -> dict[str, Any]:
+        return self._copy_or_move_workspace_entry(
+            workspace_id=workspace_id,
+            source_path=source_path,
+            target_path=target_path,
+            message=message,
+            move=False,
+        )
+
+    def move_workspace_entry(
+        self,
+        workspace_id: str,
+        source_path: str,
+        target_path: str,
+        message: str = "move entry",
+    ) -> dict[str, Any]:
+        return self._copy_or_move_workspace_entry(
+            workspace_id=workspace_id,
+            source_path=source_path,
+            target_path=target_path,
+            message=message,
+            move=True,
+        )
+
+    def _copy_or_move_workspace_entry(
+        self,
+        *,
+        workspace_id: str,
+        source_path: str,
+        target_path: str,
+        message: str,
+        move: bool,
+    ) -> dict[str, Any]:
+        if source_path == target_path:
+            raise ValueError("Source and target paths must differ")
+        if move and target_path.startswith(f"{source_path}/"):
+            raise ValueError("Cannot move a folder into itself")
+
+        with self._lock, self.connect() as conn:
+            parent_version_id = self._resolve_version_id(conn, workspace_id, None)
+            source = self._workspace_entry_snapshot(conn, workspace_id, parent_version_id, source_path)
+            if not source["exists"]:
+                raise ValueError("Source path not found")
+            target_is_folder = bool(source["folders"] or source["child_files"])
+            if self._workspace_file_ancestor_exists(conn, workspace_id, parent_version_id, target_path):
+                raise ValueError("A parent path is already a file")
+            if self._workspace_entry_conflicts(conn, workspace_id, parent_version_id, target_path, target_is_folder):
+                raise ValueError("Target path already exists")
+
+            version_id = self._create_workspace_snapshot(conn, workspace_id, parent_version_id, message)
+            if move:
+                self._delete_workspace_entry_rows(conn, workspace_id, version_id, source_path, target_is_folder)
+
+            written_files = []
+            written_folders = []
+            if source["file"] and not target_is_folder:
+                self._insert_workspace_file_record(conn, workspace_id, version_id, target_path, source["file"])
+                self._insert_parent_folders(conn, workspace_id, version_id, target_path)
+                written_files.append(target_path)
+            else:
+                self._insert_parent_folders(conn, workspace_id, version_id, f"{target_path}/.keep")
+                self._insert_workspace_folder(conn, workspace_id, version_id, target_path)
+                written_folders.append(target_path)
+                for folder in source["folders"]:
+                    next_path = self._replace_path_prefix(folder["path"], source_path, target_path)
+                    if next_path == target_path:
+                        continue
+                    self._insert_workspace_folder(conn, workspace_id, version_id, next_path)
+                    written_folders.append(next_path)
+                for file_record in source["child_files"]:
+                    next_path = self._replace_path_prefix(file_record["path"], source_path, target_path)
+                    self._insert_workspace_file_record(conn, workspace_id, version_id, next_path, file_record)
+                    self._insert_parent_folders(conn, workspace_id, version_id, next_path)
+                    written_files.append(next_path)
+
+            conn.execute(
+                """
+                INSERT INTO file_ops(id, workspace_id, version_id, op, path, old_path)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"fop_{uuid.uuid4().hex}",
+                    workspace_id,
+                    version_id,
+                    "moved" if move else "copied",
+                    target_path,
+                    source_path,
+                ),
+            )
+            self._set_workspace_version(conn, workspace_id, version_id)
+
+        return {
+            "version_id": version_id,
+            "source_path": source_path,
+            "target_path": target_path,
+            "op": "moved" if move else "copied",
+            "files": written_files,
+            "folders": written_folders,
+        }
 
     def list_file_ops(self, workspace_id: str, version_id: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -1404,6 +1558,310 @@ class DemoStore:
             return json.loads(str(value))
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    def _create_workspace_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        parent_version_id: str,
+        message: str,
+    ) -> str:
+        version_id = f"ver_{uuid.uuid4().hex}"
+        conn.execute(
+            """
+            INSERT INTO workspace_versions(id, workspace_id, parent_version_id, message)
+            VALUES (?, ?, ?, ?)
+            """,
+            (version_id, workspace_id, parent_version_id, message),
+        )
+        conn.execute(
+            """
+            INSERT INTO workspace_files(
+                workspace_id, version_id, path, blob_key, blob_sha256, size, content_type, deleted, updated_at
+            )
+            SELECT workspace_id, ?, path, blob_key, blob_sha256, size, content_type, deleted, datetime('now')
+            FROM workspace_files
+            WHERE workspace_id = ? AND version_id = ? AND deleted = 0
+            """,
+            (version_id, workspace_id, parent_version_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO workspace_folders(workspace_id, version_id, path, deleted, updated_at)
+            SELECT workspace_id, ?, path, deleted, datetime('now')
+            FROM workspace_folders
+            WHERE workspace_id = ? AND version_id = ? AND deleted = 0
+            """,
+            (version_id, workspace_id, parent_version_id),
+        )
+        return version_id
+
+    def _set_workspace_version(self, conn: sqlite3.Connection, workspace_id: str, version_id: str) -> None:
+        conn.execute(
+            """
+            UPDATE workspaces
+            SET current_version_id = ?, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (version_id, workspace_id),
+        )
+
+    @staticmethod
+    def _path_prefix_condition(column: str = "path") -> str:
+        return f"({column} = ? OR substr({column}, 1, ?) = ?)"
+
+    def _workspace_file_exists(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+    ) -> bool:
+        return bool(
+            conn.execute(
+                """
+                SELECT 1
+                FROM workspace_files
+                WHERE workspace_id = ? AND version_id = ? AND path = ? AND deleted = 0
+                """,
+                (workspace_id, version_id, path),
+            ).fetchone()
+        )
+
+    def _workspace_folder_exists(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+    ) -> bool:
+        return bool(
+            conn.execute(
+                """
+                SELECT 1
+                FROM workspace_folders
+                WHERE workspace_id = ? AND version_id = ? AND path = ? AND deleted = 0
+                """,
+                (workspace_id, version_id, path),
+            ).fetchone()
+        )
+
+    def _workspace_file_ancestor_exists(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+    ) -> bool:
+        parts = [part for part in path.split("/") if part]
+        ancestors = []
+        current = ""
+        for part in parts[:-1]:
+            current = f"{current}/{part}" if current else part
+            ancestors.append(current)
+        if not ancestors:
+            return False
+        placeholders = ",".join("?" for _ in ancestors)
+        return bool(
+            conn.execute(
+                f"""
+                SELECT 1
+                FROM workspace_files
+                WHERE workspace_id = ? AND version_id = ? AND deleted = 0 AND path IN ({placeholders})
+                LIMIT 1
+                """,
+                (workspace_id, version_id, *ancestors),
+            ).fetchone()
+        )
+
+    def _workspace_entry_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+    ) -> dict[str, Any]:
+        prefix = f"{path}/"
+        prefix_len = len(prefix)
+        file_row = conn.execute(
+            """
+            SELECT path, blob_key, blob_sha256, size, content_type, updated_at
+            FROM workspace_files
+            WHERE workspace_id = ? AND version_id = ? AND path = ? AND deleted = 0
+            """,
+            (workspace_id, version_id, path),
+        ).fetchone()
+        folder_rows = conn.execute(
+            f"""
+            SELECT path, updated_at
+            FROM workspace_folders
+            WHERE workspace_id = ? AND version_id = ? AND {self._path_prefix_condition()}
+                AND deleted = 0
+            ORDER BY path
+            """,
+            (workspace_id, version_id, path, prefix_len, prefix),
+        ).fetchall()
+        child_file_rows = conn.execute(
+            """
+            SELECT path, blob_key, blob_sha256, size, content_type, updated_at
+            FROM workspace_files
+            WHERE workspace_id = ? AND version_id = ? AND substr(path, 1, ?) = ? AND deleted = 0
+            ORDER BY path
+            """,
+            (workspace_id, version_id, prefix_len, prefix),
+        ).fetchall()
+        return {
+            "exists": bool(file_row or folder_rows or child_file_rows),
+            "file": dict(file_row) if file_row else None,
+            "folders": [dict(row) for row in folder_rows],
+            "child_files": [dict(row) for row in child_file_rows],
+        }
+
+    def _workspace_entry_conflicts(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        target_path: str,
+        target_is_folder: bool,
+    ) -> bool:
+        prefix = f"{target_path}/"
+        prefix_len = len(prefix)
+        file_conflict = conn.execute(
+            f"""
+            SELECT 1
+            FROM workspace_files
+            WHERE workspace_id = ? AND version_id = ? AND {self._path_prefix_condition()}
+                AND deleted = 0
+            LIMIT 1
+            """,
+            (workspace_id, version_id, target_path, prefix_len, prefix),
+        ).fetchone()
+        if file_conflict:
+            return True
+        folder_conflict = conn.execute(
+            f"""
+            SELECT 1
+            FROM workspace_folders
+            WHERE workspace_id = ? AND version_id = ? AND {self._path_prefix_condition()}
+                AND deleted = 0
+            LIMIT 1
+            """,
+            (workspace_id, version_id, target_path, prefix_len, prefix),
+        ).fetchone()
+        if folder_conflict:
+            return True
+        if target_is_folder:
+            return False
+        return False
+
+    def _delete_workspace_entry_rows(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+        is_folder: bool,
+    ) -> None:
+        if is_folder:
+            prefix = f"{path}/"
+            prefix_len = len(prefix)
+            conn.execute(
+                f"""
+                UPDATE workspace_folders
+                SET deleted = 1, updated_at = datetime('now')
+                WHERE workspace_id = ? AND version_id = ? AND {self._path_prefix_condition()}
+                """,
+                (workspace_id, version_id, path, prefix_len, prefix),
+            )
+            conn.execute(
+                """
+                UPDATE workspace_files
+                SET deleted = 1, updated_at = datetime('now')
+                WHERE workspace_id = ? AND version_id = ? AND (path = ? OR substr(path, 1, ?) = ?)
+                """,
+                (workspace_id, version_id, path, prefix_len, prefix),
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE workspace_files
+            SET deleted = 1, updated_at = datetime('now')
+            WHERE workspace_id = ? AND version_id = ? AND path = ?
+            """,
+            (workspace_id, version_id, path),
+        )
+
+    def _insert_workspace_folder(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO workspace_folders(workspace_id, version_id, path, deleted, updated_at)
+            VALUES (?, ?, ?, 0, datetime('now'))
+            ON CONFLICT(workspace_id, version_id, path) DO UPDATE SET
+                deleted = 0,
+                updated_at = datetime('now')
+            """,
+            (workspace_id, version_id, path),
+        )
+
+    def _insert_workspace_file_record(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+        file_record: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO workspace_files(
+                workspace_id, version_id, path, blob_key, blob_sha256, size, content_type, deleted, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, datetime('now'))
+            ON CONFLICT(workspace_id, version_id, path) DO UPDATE SET
+                blob_key = excluded.blob_key,
+                blob_sha256 = excluded.blob_sha256,
+                size = excluded.size,
+                content_type = excluded.content_type,
+                deleted = 0,
+                updated_at = datetime('now')
+            """,
+            (
+                workspace_id,
+                version_id,
+                path,
+                file_record["blob_key"],
+                file_record["blob_sha256"],
+                file_record["size"],
+                file_record["content_type"],
+            ),
+        )
+
+    def _insert_parent_folders(
+        self,
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        version_id: str,
+        path: str,
+    ) -> None:
+        parts = [part for part in path.split("/") if part]
+        current = ""
+        for part in parts[:-1]:
+            current = f"{current}/{part}" if current else part
+            self._insert_workspace_folder(conn, workspace_id, version_id, current)
+
+    @staticmethod
+    def _replace_path_prefix(path: str, source_path: str, target_path: str) -> str:
+        if path == source_path:
+            return target_path
+        return f"{target_path}/{path[len(source_path) + 1:]}"
 
     def _resolve_version_id(
         self,
