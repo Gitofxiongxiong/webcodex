@@ -1,0 +1,21 @@
+[project]
+name = "webcodex-worker"
+version = "0.1.0"
+description = "WebCodex Python worker backed by the OpenAI Agents SDK sandbox runtime."
+requires-python = ">=3.11"
+dependencies = [
+  "openai-agents[docker]==0.17.3",
+  "openai>=2,<3",
+  "docker>=7",
+  "httpx>=0.28",
+  "pydantic>=2",
+  "pydantic-settings>=2",
+  "python-dotenv>=1",
+  "starlette>=0.40,<0.42",
+]
+
+[project.scripts]
+webcodex-worker = "webcodex_worker.main:cli"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

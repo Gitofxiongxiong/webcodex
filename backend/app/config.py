@@ -9,9 +9,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///../data/webcodex_demo.db"
     api_base_url: str = "http://127.0.0.1:8000"
     worker_token: str = "dev-worker-token"
-    node_worker_entry: str = "../worker-node/src/worker.mjs"
+    python_worker_entry: str = "../worker-py/webcodex_worker/main.py"
     worker_sandbox_root: str = "../data/sandboxes"
-    worker_runs_root: str = "../data/runs"
+    worker_runs_root: str = Field(default="../data/runs", validation_alias=AliasChoices("WORKER_RUNS_ROOT", "WORKER_RUN_ROOT"))
     worker_runtime: str = "docker"
     worker_docker_image: str = "webcodex-agent-runtime:latest"
     worker_docker_auto_build: bool = True
@@ -21,7 +21,6 @@ class Settings(BaseSettings):
     worker_docker_pids_limit: str = "512"
     worker_keep_container: bool = False
     worker_keep_run_dir: bool = True
-    worker_runtime_tool_mode: str = "auto"
     openai_api_key: str = ""
     openai_base_url: str = ""
     openai_api_protocol: str = "responses"
@@ -34,6 +33,7 @@ class Settings(BaseSettings):
     openai_reasoning_summary: str = "detailed"
     openai_text_verbosity: str = "low"
     openai_service_tier: str = "priority"
+    openai_store: bool = False
     model_prices_usd_per_1m_json: str = ""
     billing_usd_to_credits_rate: float = 7.0
     openrouter_models_url: str = "https://openrouter.ai/api/v1/models"
@@ -67,8 +67,8 @@ class Settings(BaseSettings):
         return path.resolve()
 
     @property
-    def worker_entry_path(self) -> Path:
-        path = Path(self.node_worker_entry)
+    def python_worker_entry_path(self) -> Path:
+        path = Path(self.python_worker_entry)
         if not path.is_absolute():
             path = Path(__file__).resolve().parents[1] / path
         return path.resolve()

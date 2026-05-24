@@ -13,7 +13,7 @@ Set-StrictMode -Version Latest
 $Root = Split-Path -Parent $PSCommandPath
 $BackendDir = Join-Path $Root "backend"
 $FrontendDir = Join-Path $Root "frontend"
-$WorkerDir = Join-Path $Root "worker-node"
+$WorkerPyDir = Join-Path $Root "worker-py"
 $DataDir = Join-Path $Root "data"
 $EnvFile = Join-Path $Root ".env"
 $EnvExample = Join-Path $Root ".env.example"
@@ -95,12 +95,14 @@ function Ensure-PythonEnvironment {
     }
 
     $requirements = Join-Path $BackendDir "requirements.txt"
+    $workerPyProject = Join-Path $WorkerPyDir "pyproject.toml"
     $marker = Join-Path $VenvDir ".requirements.sha256"
-    $stamp = Get-DependencyStamp @($requirements)
+    $stamp = Get-DependencyStamp @($requirements, $workerPyProject)
     $current = if (Test-Path $marker) { Get-Content -Raw -LiteralPath $marker } else { "" }
     if ($current -ne $stamp) {
-        Write-Step "Installing backend Python dependencies"
+        Write-Step "Installing backend and worker Python dependencies"
         & $VenvPython -m pip install -r $requirements
+        & $VenvPython -m pip install -e $WorkerPyDir
         Set-Content -LiteralPath $marker -Value $stamp -NoNewline -Encoding UTF8
     }
 }
@@ -138,7 +140,6 @@ function Ensure-NodePackage {
 
 function Ensure-NodeEnvironment {
     Find-CommandPath "node" | Out-Null
-    Ensure-NodePackage -Name "worker-node" -Directory $WorkerDir
     Ensure-NodePackage -Name "frontend" -Directory $FrontendDir
 }
 

@@ -2069,37 +2069,19 @@ class DemoStore:
         if role == "user" and isinstance(payload, dict):
             item = payload.get("agent_item")
             if isinstance(item, dict):
-                return item
+                return self._sandbox_only_agent_item(item)
             text = str(payload.get("text") or content or "")
-            parts: list[dict[str, Any]] = []
-            if text:
-                parts.append({"type": "input_text", "text": text})
             payload_attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
             message_attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
-            for attachment in message_attachments or payload_attachments:
-                if not isinstance(attachment, dict):
-                    continue
-                openai_file_id = str(attachment.get("openai_file_id") or "").strip()
-                model_kind = str(attachment.get("model_kind") or "")
-                if not openai_file_id:
-                    continue
-                if model_kind == "image":
-                    parts.append({
-                        "type": "input_image",
-                        "image": {"id": openai_file_id},
-                        "detail": attachment.get("image_detail") or "auto",
-                    })
-                else:
-                    parts.append({
-                        "type": "input_file",
-                        "file": {"id": openai_file_id},
-                        "filename": attachment.get("safe_name") or attachment.get("original_name"),
-                    })
-            if parts:
+            attachment_lines = self._attachment_lines(message_attachments or payload_attachments)
+            if text or attachment_lines:
                 return {
                     "type": "message",
                     "role": "user",
-                    "content": parts,
+                    "content": [{
+                        "type": "input_text",
+                        "text": self._compose_attachment_text(text, attachment_lines),
+                    }],
                 }
         if not content:
             return None
@@ -2117,6 +2099,76 @@ class DemoStore:
                 "content": [{"type": "output_text", "text": content}],
             }
         return None
+
+    def _sandbox_only_agent_item(self, item: dict[str, Any]) -> dict[str, Any] | None:
+        if item.get("role") != "user":
+            return item
+        content = item.get("content")
+        if isinstance(content, str):
+            return {
+                "type": "message",
+                "role": "user",
+                "content": content,
+            }
+        if not isinstance(content, list):
+            return item
+
+        texts: list[str] = []
+        paths: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "input_text":
+                text = str(part.get("text") or "")
+                if text:
+                    texts.append(text)
+                continue
+            if part.get("type") in {"input_image", "input_file"}:
+                provider_data = part.get("providerData") if isinstance(part.get("providerData"), dict) else {}
+                workspace_path = str(provider_data.get("workspace_path") or part.get("workspace_path") or "").strip()
+                if workspace_path and workspace_path not in paths:
+                    paths.append(workspace_path)
+
+        text = "\n\n".join(texts)
+        attachment_lines = [f"- {workspace_path}" for workspace_path in paths if workspace_path not in text]
+        composed = self._compose_attachment_text(text, attachment_lines) if attachment_lines else text.strip()
+        if not composed:
+            return None
+        return {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": composed,
+            }],
+        }
+
+    def _attachment_lines(self, attachments: list[dict[str, Any]]) -> list[str]:
+        lines = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            workspace_path = str(attachment.get("workspace_path") or "").strip()
+            if not workspace_path:
+                continue
+            details = [
+                str(attachment.get("content_type") or "").strip(),
+                f"{attachment.get('size')} bytes" if attachment.get("size") is not None else "",
+                "sandbox",
+            ]
+            detail_text = ", ".join(detail for detail in details if detail)
+            lines.append(f"- {workspace_path} ({detail_text})" if detail_text else f"- {workspace_path}")
+        return lines
+
+    def _compose_attachment_text(self, text: str, attachment_lines: list[str]) -> str:
+        lines = [text.strip() or "Please analyze the attached files."]
+        if attachment_lines:
+            lines.extend([
+                "",
+                "Uploaded attachments have been copied into Docker /sandbox only; listed paths are /sandbox-relative:",
+                *attachment_lines,
+            ])
+        return "\n".join(lines)
 
     @staticmethod
     def _json_or_none(value: Any) -> Any:

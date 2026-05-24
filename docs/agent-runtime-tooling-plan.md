@@ -1,5 +1,10 @@
 # WebCodex Agent Runtime Tooling Plan
 
+> Status: superseded. This JS custom-runtime plan has been replaced by
+> `docs/official-python-sandbox-migration-plan.md`, which moves WebCodex to the
+> official OpenAI Agents Python SDK `SandboxAgent` / `DockerSandboxClient`
+> architecture. Keep this file only as historical context.
+
 ## 1. 目标
 
 当前目标是把 WebCodex 的 agent 工具层从大量自定义 sandbox 工具，收敛为更接近 OpenAI Agents SDK 原生工具语义的运行时。

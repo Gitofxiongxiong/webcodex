@@ -699,7 +699,8 @@ def health() -> dict:
             "configured": settings.oss_configured,
         },
         "worker": {
-            "runtime": "openai-agents-js",
+            "runtime": "openai-agents-python",
+            "impl": "python",
             "model": settings.openai_model,
             "sandbox_root": str(settings.worker_sandbox_root_path),
             "reasoning_effort": settings.openai_reasoning_effort,
@@ -1415,10 +1416,13 @@ def conversation_sandbox_workspace_dir(conversation_id: str) -> Path:
 
 
 def sandbox_workspace_dir_for_run(run_id: str) -> Path:
+    run_workspace = settings.worker_runs_root_path / run_id / "workspace"
+    if run_workspace.exists():
+        return run_workspace
     run = store.get_run(run_id)
     conversation_id = str(run.get("conversation_id") or "") if run else ""
     if not conversation_id:
-        return settings.worker_runs_root_path / run_id / "workspace"
+        return run_workspace
     return conversation_sandbox_workspace_dir(conversation_id)
 
 
@@ -2005,7 +2009,7 @@ async def run_scheduler_loop() -> None:
             continue
         run_settings = run_settings_from_record(claimed)
         try:
-            await start_node_worker(
+            await start_worker(
                 run_id=claimed["id"],
                 conversation_id=claimed["conversation_id"],
                 workspace_id=claimed["workspace_id"],
@@ -2023,6 +2027,20 @@ async def run_scheduler_loop() -> None:
                 },
             )
             store.set_run_status(claimed["id"], "failed")
+
+
+async def start_worker(
+    run_id: str,
+    conversation_id: str,
+    workspace_id: str,
+    run_settings: RunExecutionSettings,
+) -> None:
+    await start_python_worker(
+        run_id,
+        conversation_id=conversation_id,
+        workspace_id=workspace_id,
+        run_settings=run_settings,
+    )
 
 
 async def store_uploaded_attachment(
@@ -2177,7 +2195,7 @@ def public_attachment(attachment: dict, include_internal: bool = False) -> dict:
     return result
 
 
-async def start_node_worker(
+async def start_python_worker(
     run_id: str,
     conversation_id: str,
     workspace_id: str,
@@ -2186,20 +2204,16 @@ async def start_node_worker(
     run = store.get_run(run_id)
     if not run or run["status"] in TERMINAL_RUN_STATUSES:
         return
-    worker_entry = settings.worker_entry_path
-    sandbox_dir = conversation_sandbox_workspace_dir(conversation_id)
+    worker_entry = settings.python_worker_entry_path
     run_dir = settings.worker_runs_root_path / run_id
-    run_workspace_dir = sandbox_dir
-    run_artifacts_dir = run_dir / "artifacts"
-    run_workspace_dir.mkdir(parents=True, exist_ok=True)
-    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
     if not worker_entry.exists():
         store.append_event(
             run_id,
             {
                 "type": "run.failed",
                 "visibility": "user",
-                "payload": {"error": f"Node worker not found: {worker_entry}"},
+                "payload": {"error": f"Python worker not found: {worker_entry}"},
             },
         )
         store.set_run_status(run_id, "failed")
@@ -2214,28 +2228,18 @@ async def start_node_worker(
             "RUN_ID": run_id,
             "CONVERSATION_ID": conversation_id,
             "WORKSPACE_ID": workspace_id,
-            "SANDBOX_DIR": str(sandbox_dir),
-            "RUN_WORKSPACE_DIR": str(run_workspace_dir),
-            "RUN_ARTIFACTS_DIR": str(run_artifacts_dir),
             "WORKER_RUNTIME": settings.worker_runtime,
             "WORKER_DOCKER_IMAGE": settings.worker_docker_image,
-            "WORKER_DOCKER_AUTO_BUILD": str(settings.worker_docker_auto_build).lower(),
-            "WORKER_DOCKER_NETWORK": settings.worker_docker_network,
-            "WORKER_DOCKER_CPUS": settings.worker_docker_cpus,
-            "WORKER_DOCKER_MEMORY": settings.worker_docker_memory,
-            "WORKER_DOCKER_PIDS_LIMIT": settings.worker_docker_pids_limit,
+            "WORKER_RUN_ROOT": str(settings.worker_runs_root_path),
             "WORKER_KEEP_CONTAINER": str(settings.worker_keep_container).lower(),
-            "WORKER_RUNTIME_TOOL_MODE": settings.worker_runtime_tool_mode,
             "OPENAI_MODEL": run_settings.model,
-            "OPENAI_COMPACTION_ENABLED": str(settings.openai_compaction_enabled).lower(),
             "OPENAI_API_PROTOCOL": settings.openai_api_protocol,
             "OPENAI_PROVIDER_PROFILE": provider_profile,
-            "OPENAI_RESPONSES_RELAY_MODE": settings.openai_responses_relay_mode,
             "OPENAI_REASONING_EFFORT": run_settings.reasoning_effort,
             "OPENAI_REASONING_SUMMARY": run_settings.reasoning_summary,
             "OPENAI_TEXT_VERBOSITY": run_settings.text_verbosity,
             "OPENAI_SERVICE_TIER": run_settings.service_tier,
-            "OPENAI_SEND_SERVICE_TIER": settings.openai_send_service_tier,
+            "OPENAI_STORE": str(settings.openai_store).lower(),
             "OPENAI_SPEED_MODE": run_settings.speed_mode,
             "OPENAI_MODEL_PROVIDER": provider_label,
             "OPENAI_AGENTS_DISABLE_TRACING": "1",
@@ -2249,18 +2253,39 @@ async def start_node_worker(
         env["OPENAI_API_KEY"] = settings.codex_relay_api_key
         env["OPENAI_BASE_URL"] = f"{settings.api_base_url.rstrip('/')}/codex-relay/v1"
 
-    node_executable = shutil.which("node")
-    if not node_executable:
+    if settings.worker_runtime == "docker":
+        try:
+            await asyncio.to_thread(ensure_local_worker_image, settings.worker_docker_image)
+        except Exception as exc:
+            store.append_event(
+                run_id,
+                {
+                    "type": "run.failed",
+                    "visibility": "user",
+                    "payload": {"error": f"Docker worker image is not ready: {exc}"},
+                },
+            )
+            store.set_run_status(run_id, "failed")
+            return
+
+    python_executable = sys.executable or shutil.which("python3")
+    if not python_executable:
         store.append_event(
             run_id,
             {
                 "type": "run.failed",
                 "visibility": "user",
-                "payload": {"error": "Node.js executable was not found in PATH"},
+                "payload": {"error": "Python executable was not found"},
             },
         )
         store.set_run_status(run_id, "failed")
         return
+
+    worker_root = worker_entry.parents[1]
+    python_path = [str(worker_root)]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
 
     run = store.get_run(run_id)
     if not run or run["status"] in TERMINAL_RUN_STATUSES:
@@ -2270,8 +2295,8 @@ async def start_node_worker(
         code = await asyncio.to_thread(
             run_worker_process,
             run_id=run_id,
-            node_executable=node_executable,
-            worker_entry=worker_entry,
+            command=[python_executable, "-m", "webcodex_worker.main"],
+            cwd=worker_root,
             env=env,
         )
     except Exception as exc:
@@ -2280,7 +2305,7 @@ async def start_node_worker(
             {
                 "type": "run.failed",
                 "visibility": "user",
-                "payload": {"error": f"Node worker failed to start: {exc}"},
+                "payload": {"error": f"Python worker failed to start: {exc}"},
             },
         )
         store.set_run_status(run_id, "failed")
@@ -2296,22 +2321,73 @@ async def start_node_worker(
             {
                 "type": "run.failed",
                 "visibility": "user",
-                "payload": {"error": f"Node worker exited with code {code}"},
+                "payload": {"error": f"Python worker exited with code {code}"},
             },
         )
         store.set_run_status(run_id, "failed")
 
 
+def ensure_local_worker_image(image: str) -> None:
+    if docker_image_exists(image):
+        return
+    if not settings.worker_docker_auto_build:
+        return
+    if not should_auto_build_worker_image(image):
+        return
+    dockerfile = worker_runtime_dockerfile_path()
+    if not dockerfile.exists():
+        raise RuntimeError(f"Dockerfile not found: {dockerfile}")
+    result = subprocess.run(
+        ["docker", "build", "-f", str(dockerfile), "-t", image, str(dockerfile.parent)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+        raise RuntimeError(output[-4000:] or f"docker build exited with code {result.returncode}")
+
+
+def docker_image_exists(image: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    stderr = (result.stderr or "").lower()
+    if "permission denied" in stderr or "cannot connect" in stderr:
+        raise RuntimeError(result.stderr.strip())
+    return False
+
+
+def should_auto_build_worker_image(image: str) -> bool:
+    repository = image.split(":", 1)[0]
+    return "/" not in repository and repository.startswith("webcodex")
+
+
+def worker_runtime_dockerfile_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "worker-py" / "Dockerfile.agent-runtime"
+
+
 def run_worker_process(
     *,
     run_id: str,
-    node_executable: str,
-    worker_entry,
+    command: list[str],
+    cwd: Path,
     env: dict[str, str],
 ) -> int:
     process = subprocess.Popen(
-        [node_executable, str(worker_entry)],
-        cwd=str(worker_entry.parent),
+        command,
+        cwd=str(cwd),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

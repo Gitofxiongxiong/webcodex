@@ -1,0 +1,728 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebCodex 项目详细说明</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d8dee9;
+      --soft: #eef3f8;
+      --accent: #1769aa;
+      --accent-2: #0f8b6f;
+      --warn: #9a5b00;
+      --code: #132238;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 40px 24px 72px;
+    }
+
+    header {
+      padding: 42px 0 28px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(34px, 5vw, 56px);
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 42px 0 16px;
+      font-size: 28px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 26px 0 10px;
+      font-size: 20px;
+      line-height: 1.35;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    .lead {
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 19px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 5px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 28px;
+      align-items: start;
+    }
+
+    nav {
+      position: sticky;
+      top: 18px;
+      margin-top: 28px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    nav strong {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    nav a {
+      display: block;
+      padding: 7px 0;
+      color: var(--ink);
+      font-size: 14px;
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    section {
+      scroll-margin-top: 24px;
+    }
+
+    .card {
+      margin: 16px 0;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .stat {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft);
+    }
+
+    .stat b {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 15px;
+    }
+
+    .stat span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    code {
+      padding: 2px 5px;
+      border-radius: 5px;
+      background: #e7edf5;
+      color: var(--code);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: .92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 16px 0;
+      padding: 18px;
+      border-radius: 8px;
+      background: #132238;
+      color: #e8eef7;
+      font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+
+    ul, ol {
+      margin: 8px 0 16px 22px;
+      padding: 0;
+    }
+
+    li {
+      margin: 5px 0;
+    }
+
+    table {
+      width: 100%;
+      margin: 16px 0;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    th, td {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: var(--soft);
+      font-size: 14px;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: #e7f4f1;
+      color: var(--accent-2);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #edf6ff;
+    }
+
+    .warning {
+      border-left: 4px solid var(--warn);
+      background: #fff7e8;
+    }
+
+    .flow {
+      display: grid;
+      gap: 10px;
+    }
+
+    .step {
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .step b {
+      color: var(--accent);
+    }
+
+    footer {
+      margin-top: 46px;
+      padding-top: 20px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      nav {
+        position: static;
+      }
+
+      .grid, .grid.three {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>WebCodex 项目详细说明</h1>
+      <p class="lead">
+        WebCodex 是一个 Web 版 Codex/Agent Demo：用户在浏览器发起代码任务，FastAPI 负责业务数据、文件索引、事件流和 Worker 调度，Python Worker 基于 OpenAI Agents Python SDK 运行 <code>SandboxAgent</code>，并在官方 Docker 沙箱中执行命令、编辑文件和查看图片。
+      </p>
+      <div class="meta">
+        <span class="pill">仓库：Gitofxiongxiong/webcodex</span>
+        <span class="pill">后端：FastAPI + SQLite + Aliyun OSS</span>
+        <span class="pill">Worker：Python + OpenAI Agents SDK</span>
+        <span class="pill">前端：Vite + React 19 + Tailwind 4</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav aria-label="文档目录">
+        <strong>目录</strong>
+        <a href="#summary">1. 项目定位</a>
+        <a href="#architecture">2. 总体架构</a>
+        <a href="#structure">3. 目录结构</a>
+        <a href="#backend">4. 后端说明</a>
+        <a href="#worker">5. Worker 与沙箱</a>
+        <a href="#frontend">6. 前端说明</a>
+        <a href="#data">7. 数据与文件模型</a>
+        <a href="#api">8. API 分组</a>
+        <a href="#config">9. 配置与启动</a>
+        <a href="#flows">10. 关键流程</a>
+        <a href="#limits">11. 限制与演进</a>
+      </nav>
+
+      <main>
+        <section id="summary">
+          <h2>1. 项目定位</h2>
+          <div class="card">
+            <p>
+              这个项目不是普通聊天页面，而是围绕“浏览器发起任务、后端持久化状态、Worker 执行 Agent、沙箱承载代码操作、前端实时展示过程”的完整 Demo。
+            </p>
+            <p>
+              当前版本已经覆盖用户注册登录、默认工作空间、工作空间文件管理、附件上传、对话历史、Run 创建与取消、SSE 事件重放、模型用量统计、Docker 沙箱命令执行，以及兼容 OpenAI 官方 Responses API 和本地 Codex Relay 两类模型接入路径。
+            </p>
+          </div>
+          <div class="grid three">
+            <div class="stat">
+              <b>业务元数据</b>
+              <span>SQLite 保存用户、工作空间、版本、消息、Run、事件、用量和账单流水。</span>
+            </div>
+            <div class="stat">
+              <b>文件内容</b>
+              <span>Aliyun OSS 按 SHA-256 内容寻址保存文件 blob，SQLite 只保存索引。</span>
+            </div>
+            <div class="stat">
+              <b>Agent 执行</b>
+              <span>Python Worker 调用 OpenAI Agents SDK，并将命令限制在 Docker /workspace。</span>
+            </div>
+          </div>
+        </section>
+
+        <section id="architecture">
+          <h2>2. 总体架构</h2>
+          <pre><code>Browser
+  -> FastAPI Backend
+      -> SQLite: users, workspaces, versions, conversations, runs, events, usage
+      -> Aliyun OSS: content-addressed file blobs
+      -> Python Worker process per run
+          -> OpenAI Agents Python SDK SandboxAgent
+          -> Official Docker sandbox mounted at /workspace
+          -> Sandbox tools such as shell, apply_patch and view_image
+      -> SSE event stream
+  -> Browser UI renders assistant text, reasoning, tool calls, usage and exports</code></pre>
+          <div class="card note">
+            <p>
+              架构上有两个清晰边界：持久工作空间在后端和 OSS 中，Agent 的临时执行区在 Docker 沙箱中。Agent 需要先通过 <code>workspace_tree</code> / <code>workspace_rg</code> 发现文件，再用 <code>workspace_import</code> 将文件导入沙箱，编辑后如果启用了导出工具再显式写回工作空间。
+            </p>
+          </div>
+        </section>
+
+        <section id="structure">
+          <h2>3. 目录结构</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>路径</th>
+                <th>作用</th>
+                <th>关键文件</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>backend/</code></td>
+                <td>FastAPI API、SQLite 访问层、OSS 存储、Codex Relay、Worker 调度。</td>
+                <td><code>app/main.py</code>、<code>app/db.py</code>、<code>app/config.py</code>、<code>app/oss_store.py</code>、<code>app/codex_relay.py</code></td>
+              </tr>
+              <tr>
+                <td><code>worker-py/</code></td>
+                <td>Python Worker，使用 OpenAI Agents Python SDK 的 <code>SandboxAgent</code> 和官方 Docker sandbox，负责附件处理、事件归一化和工作空间回写。</td>
+                <td><code>webcodex_worker/main.py</code>、<code>webcodex_worker/sandbox_runner.py</code>、<code>Dockerfile.agent-runtime</code></td>
+              </tr>
+              <tr>
+                <td><code>frontend/</code></td>
+                <td>Vite + React 前端，提供登录、聊天、工作空间文件管理、附件上传、事件流展示和用量面板。</td>
+                <td><code>src/main.jsx</code>、<code>src/styles/app.css</code>、<code>src/components/markdown/MarkdownRenderer.jsx</code></td>
+              </tr>
+              <tr>
+                <td><code>docs/</code></td>
+                <td>产品与架构文档。</td>
+                <td><code>PRD.md</code>、<code>agent-runtime-tooling-plan.md</code>、<code>project-overview.html</code></td>
+              </tr>
+              <tr>
+                <td><code>start.ps1</code></td>
+                <td>Windows PowerShell 快速启动脚本，自动创建环境、安装依赖、启动后端和前端。</td>
+                <td>支持 <code>-Restart</code>、<code>-SkipInstall</code>、<code>-Open</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="backend">
+          <h2>4. 后端说明</h2>
+          <h3>4.1 FastAPI 主入口</h3>
+          <p>
+            <code>backend/app/main.py</code> 是后端核心，包含 CORS、健康检查、认证、工作空间、附件、对话、Run、SSE、Worker 内部接口、模型用量计费和 Codex Relay 路由。
+          </p>
+          <div class="grid">
+            <div class="card">
+              <h3>用户与会话</h3>
+              <p>支持注册、登录、登出和当前用户查询。密码使用 PBKDF2-SHA256 加盐哈希，登录后发放随机 session token，数据库只保存 token hash。</p>
+            </div>
+            <div class="card">
+              <h3>Run 调度</h3>
+              <p>用户创建 Run 后，后端写入 <code>run.queued</code> 事件。启动时和后台循环会扫描 <code>queued</code> / <code>starting</code> 状态并拉起 Python Worker。</p>
+            </div>
+            <div class="card">
+              <h3>SSE 事件</h3>
+              <p>Worker 将标准化事件 POST 到后端，后端写入 <code>run_events</code>。浏览器通过 <code>/api/runs/{run_id}/events</code> 消费事件，并可用 <code>after</code> 参数重放。</p>
+            </div>
+            <div class="card">
+              <h3>用量与计费</h3>
+              <p>后端记录 <code>model.usage</code> 和上下文估算，按模型价格表计算 micro USD 和 micro credits，并写入 usage events 与 billing ledger。</p>
+            </div>
+          </div>
+
+          <h3>4.2 配置层</h3>
+          <p>
+            <code>backend/app/config.py</code> 使用 <code>pydantic-settings</code> 从 <code>../.env</code> 读取配置。它统一解析 SQLite 路径、Python Worker 入口、沙箱目录、Run 目录、Codex Relay auth 文件和 OSS 配置。
+          </p>
+
+          <h3>4.3 OSS 存储</h3>
+          <p>
+            <code>AliyunObjectStore</code> 是内容寻址 blob store。写入时计算 SHA-256，并保存到 <code>{OSS_KEY_PREFIX}/objects/{sha前两位}/{sha}</code>。如果同一个 SHA 已存在，则复用对象，减少重复存储。
+          </p>
+
+          <h3>4.4 Codex Relay</h3>
+          <p>
+            当没有官方 OpenAI API Key，且配置了 <code>CODEX_RELAY_AUTH_FILE</code> 时，后端可暴露 <code>/codex-relay/v1/responses</code>。该路由读取 <code>docs/auth.json</code>，必要时刷新 ChatGPT access token，再转发到 <code>chatgpt.com/backend-api/codex/responses</code>。
+          </p>
+        </section>
+
+        <section id="worker">
+          <h2>5. Worker 与沙箱</h2>
+          <p>
+            <code>worker-py/webcodex_worker/main.py</code> 是每个 Run 的执行进程。后端通过环境变量注入 <code>RUN_ID</code>、<code>CONVERSATION_ID</code>、<code>WORKSPACE_ID</code>、模型参数、API 地址、Worker Token 和 Docker 运行参数。
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>能力</th>
+                <th>实现</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>模型运行</td>
+                <td><code>openai-agents</code> 的 <code>SandboxAgent</code>、<code>Runner</code> 和 <code>DockerSandboxClient</code></td>
+                <td>默认模型为 <code>gpt-5.5</code>，通过 Responses API 运行官方 sandbox agent。</td>
+              </tr>
+              <tr>
+                <td>工具调用</td>
+                <td><code>Capabilities.default()</code></td>
+                <td>暴露官方 sandbox 能力，包括 shell、<code>apply_patch</code>、<code>view_image</code> 等工具。</td>
+              </tr>
+              <tr>
+                <td>沙箱</td>
+                <td><code>DockerSandboxClient</code></td>
+                <td>Worker 将工作空间物化到 <code>data/runs/{run_id}/workspace</code>，容器内根路径是 <code>/workspace</code>，产物目录是 <code>/workspace/outputs</code>。</td>
+              </tr>
+              <tr>
+                <td>工作空间桥接</td>
+                <td><code>materialize_workspace</code>、<code>create_diff</code>、<code>commit_workspace_changes</code></td>
+                <td>Worker 先通过后端内部 API 拉取工作空间文件，运行结束后扫描差异并写回 OSS/SQLite。</td>
+              </tr>
+              <tr>
+                <td>附件处理</td>
+                <td><code>materialize_attachments</code></td>
+                <td>附件会复制到 <code>/workspace/attachments</code>，用户输入会附带可访问的本地路径，图片可由 <code>view_image</code> 工具查看。</td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="card warning">
+            <p>
+              当前 Docker 网络默认是 <code>bridge</code>，即容器内命令可访问网络。生产环境如果承载敏感代码，应进一步收敛网络、磁盘、凭据和导出策略。
+            </p>
+          </div>
+        </section>
+
+        <section id="frontend">
+          <h2>6. 前端说明</h2>
+          <p>
+            前端位于 <code>frontend/src/main.jsx</code>，使用 React 19 单文件主应用组织大部分状态和 UI。它通过 <code>localStorage</code> 保存 API Base URL 与登录态，通过 Fetch 调后端 API，通过 <code>EventSource</code> 接收 Run 事件。
+          </p>
+          <div class="grid">
+            <div class="stat">
+              <b>登录注册</b>
+              <span>未登录时显示认证页，登录后加载当前用户、默认工作空间、历史会话和模型目录。</span>
+            </div>
+            <div class="stat">
+              <b>聊天运行</b>
+              <span>提交消息时创建 conversation/run，显示 assistant 文本、思考过程、工具调用和停止按钮。</span>
+            </div>
+            <div class="stat">
+              <b>附件上传</b>
+              <span>支持拖拽、粘贴和文件选择，每条消息最多 20 个附件，上传后同时进入工作空间和模型输入链路。</span>
+            </div>
+            <div class="stat">
+              <b>工作空间</b>
+              <span>支持文件列表、目录、上传、复制、移动和刷新；聊天页也可打开文件树抽屉。</span>
+            </div>
+          </div>
+          <p>
+            Markdown 渲染使用 <code>streamdown</code> 相关依赖和本地 <code>MarkdownRenderer.jsx</code>，用于展示模型输出、代码块、数学公式和 CJK 内容。
+          </p>
+        </section>
+
+        <section id="data">
+          <h2>7. 数据与文件模型</h2>
+          <h3>7.1 SQLite 表</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>表</th>
+                <th>用途</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>users</code>、<code>auth_sessions</code></td><td>用户账号、密码哈希、登录 session。</td></tr>
+              <tr><td><code>workspaces</code>、<code>workspace_versions</code></td><td>每个用户一个默认工作空间，文件变更形成版本。</td></tr>
+              <tr><td><code>workspace_files</code>、<code>workspace_folders</code>、<code>file_ops</code></td><td>当前和历史版本中的文件/目录索引，以及写入、复制、移动等操作历史。</td></tr>
+              <tr><td><code>conversations</code>、<code>messages</code>、<code>conversation_agent_items</code></td><td>会话、用户/助手消息，以及 Agents SDK session replay item。</td></tr>
+              <tr><td><code>runs</code>、<code>run_events</code></td><td>一次 Agent 执行及其可重放事件流。</td></tr>
+              <tr><td><code>attachments</code>、<code>message_attachments</code>、<code>run_attachments</code></td><td>上传附件、消息关联和 Run 内部处理状态。</td></tr>
+              <tr><td><code>run_context_snapshots</code>、<code>model_usage_events</code>、<code>billing_ledger</code></td><td>上下文估算、模型 token 用量、费用和金币流水。</td></tr>
+            </tbody>
+          </table>
+
+          <h3>7.2 文件内容与版本</h3>
+          <p>
+            每次写工作空间文件时，后端会把内容写入 OSS，然后创建一个新的 workspace version。新版本复制上一版本的文件快照，再替换被修改的路径，最后更新 <code>workspaces.current_version_id</code>。
+          </p>
+          <pre><code>PUT /api/workspaces/{workspace_id}/files/{path}
+  -> calculate sha256
+  -> put OSS object: {OSS_KEY_PREFIX}/objects/{sha[0:2]}/{sha}
+  -> create workspace version
+  -> write workspace_files row
+  -> append file_ops row</code></pre>
+        </section>
+
+        <section id="api">
+          <h2>8. API 分组</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>分组</th>
+                <th>代表接口</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>健康检查</td>
+                <td><code>GET /health</code></td>
+                <td>返回数据库、OSS、Worker、模型、Codex Relay 配置状态。</td>
+              </tr>
+              <tr>
+                <td>认证</td>
+                <td><code>POST /api/auth/register</code>、<code>POST /api/auth/login</code>、<code>GET /api/auth/me</code></td>
+                <td>浏览器用户入口，除 demo 兼容接口外，大部分用户 API 都依赖 Bearer token。</td>
+              </tr>
+              <tr>
+                <td>模型与费用</td>
+                <td><code>GET /api/models/catalog</code>、<code>GET /api/billing/usage</code>、<code>GET /api/runs/{run_id}/usage</code></td>
+                <td>查询模型目录、价格、单 Run 用量和用户累计用量。</td>
+              </tr>
+              <tr>
+                <td>工作空间</td>
+                <td><code>GET /api/workspaces</code>、<code>GET /api/workspaces/{id}/files</code>、<code>PUT /api/workspaces/{id}/files/{path}</code></td>
+                <td>文件列表、目录创建、上传、复制、移动、读取、下载和操作历史。</td>
+              </tr>
+              <tr>
+                <td>附件</td>
+                <td><code>POST /api/attachments</code>、<code>GET /api/attachments/{id}/content</code></td>
+                <td>聊天附件上传和下载，大小上限为 100 MB，单条消息最多 20 个。</td>
+              </tr>
+              <tr>
+                <td>对话与 Run</td>
+                <td><code>POST /api/conversations</code>、<code>POST /api/conversations/{id}/runs</code>、<code>GET /api/runs/{id}/events</code></td>
+                <td>创建会话、发起 Agent 运行、取消运行、查询消息、查询事件历史和 SSE 实时流。</td>
+              </tr>
+              <tr>
+                <td>Worker 内部接口</td>
+                <td><code>/internal/workspaces/*</code>、<code>/internal/runs/*</code>、<code>/internal/attachments/*</code></td>
+                <td>只给 Python Worker 使用，依赖 <code>WORKER_TOKEN</code>，用于工作空间同步、事件写入、附件读取和 session item 保存。</td>
+              </tr>
+              <tr>
+                <td>Codex Relay</td>
+                <td><code>POST /codex-relay/v1/responses</code></td>
+                <td>可选兼容路径，需要 <code>CODEX_RELAY_ENABLED</code>、本地 auth 文件和 relay token。</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section id="config">
+          <h2>9. 配置与启动</h2>
+          <h3>9.1 关键配置</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>配置</th>
+                <th>默认值或示例</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>DATABASE_URL</code></td><td><code>sqlite:///../data/webcodex_demo.db</code></td><td>当前只支持 SQLite URL。</td></tr>
+              <tr><td><code>API_BASE_URL</code></td><td><code>http://127.0.0.1:8000</code></td><td>Worker 回调后端、前端默认访问后端的基础地址。</td></tr>
+              <tr><td><code>WORKER_RUNTIME</code></td><td><code>docker</code></td><td>默认 Docker，也支持代码中的 local 模式。</td></tr>
+              <tr><td><code>OPENAI_API_KEY</code></td><td>空或真实 key</td><td>有值时优先使用官方或兼容 OpenAI API。</td></tr>
+              <tr><td><code>OPENAI_BASE_URL</code></td><td>空</td><td>可填 new-api 等兼容 <code>/v1</code> 地址。</td></tr>
+              <tr><td><code>CODEX_RELAY_ENABLED</code></td><td><code>false</code> in <code>.env.example</code></td><td>开启后可走本地 Codex relay。</td></tr>
+              <tr><td><code>OSS_ACCESS_KEY_ID</code> 等</td><td>需要自行填写</td><td>OSS 未配置时，文件上传、工作空间写入、附件能力会不可用。</td></tr>
+            </tbody>
+          </table>
+
+          <h3>9.2 启动方式</h3>
+          <p>仓库提供 PowerShell 快速启动脚本：</p>
+          <pre><code>.\start.ps1
+.\start.ps1 -Restart
+.\start.ps1 -SkipInstall
+.\start.ps1 -Open</code></pre>
+          <p>
+            脚本会创建 <code>.env</code>、Python 虚拟环境、安装后端/前端/Worker 依赖，并启动后端 <code>http://127.0.0.1:8000</code> 与前端 <code>http://127.0.0.1:5173</code>。
+          </p>
+          <p>手动启动方式：</p>
+          <pre><code>cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -e ..\worker-py
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+cd ..\frontend
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173</code></pre>
+        </section>
+
+        <section id="flows">
+          <h2>10. 关键流程</h2>
+          <h3>10.1 用户发起一次 Agent Run</h3>
+          <div class="flow">
+            <div class="step"><b>1.</b> 前端提交消息和附件 ID 到 <code>POST /api/conversations/{conversation_id}/runs</code>。</div>
+            <div class="step"><b>2.</b> 后端校验用户、工作空间、附件归属，保存用户消息、Run 记录和 <code>run.queued</code> 事件。</div>
+            <div class="step"><b>3.</b> 后端调度器将 Run 从队列拉起，启动 Python Worker 进程。</div>
+            <div class="step"><b>4.</b> Worker 物化工作空间、读取历史 session item、处理附件、创建官方 Docker sandbox。</div>
+            <div class="step"><b>5.</b> Worker 运行 <code>SandboxAgent</code>，模型可调用 shell、apply_patch、view_image 等官方 sandbox 工具。</div>
+            <div class="step"><b>6.</b> Worker 将 SDK 事件归一化后 POST 到 <code>/internal/runs/{run_id}/events</code>。</div>
+            <div class="step"><b>7.</b> 后端写入事件、用量、助手消息，并通过 SSE 推给前端实时展示。</div>
+          </div>
+
+          <h3>10.2 附件处理流程</h3>
+          <pre><code>Browser upload
+  -> FastAPI validates owner and size
+  -> Aliyun OSS stores bytes by sha256
+  -> SQLite attachments and workspace index are updated
+  -> Worker downloads attachment bytes
+  -> Worker writes file into Docker /sandbox
+  -> Worker sends image/file model parts when provider supports it</code></pre>
+
+          <h3>10.3 沙箱导出流程</h3>
+          <p>
+            Worker 指令要求模型如果要交付生成文件，应写入 <code>/sandbox/outputs/</code>，并在最终回答中用 <code>![描述](sandbox://outputs/file.ext)</code> 形式引用。后端在 <code>assistant.message.done</code> 时扫描这些引用，将沙箱文件导出到工作空间并产生 <code>sandbox.exports.created</code> 事件。
+          </p>
+        </section>
+
+        <section id="limits">
+          <h2>11. 限制与演进</h2>
+          <div class="card warning">
+            <h3>当前限制</h3>
+            <ul>
+              <li>SQLite 适合 Demo 和单机验证，不适合作为高并发生产数据库。</li>
+              <li>SSE 事件使用 SQLite 轮询，生产环境应替换为 Redis Stream、NATS 或 Kafka。</li>
+              <li>OSS 必须配置后，工作空间文件和附件能力才完整可用。</li>
+              <li>默认 Docker 网络允许公网访问，生产环境需要按任务、租户或安全等级细化网络策略。</li>
+              <li>默认支持模型集合目前只包含 <code>gpt-5.5</code>，新增模型需要同步更新后端 catalog 和前端选项。</li>
+              <li><code>workspace_export</code> 工具由 <code>WORKER_ENABLE_WORKSPACE_EXPORT=true</code> 控制，不是默认暴露。</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <h3>推荐演进方向</h3>
+            <ul>
+              <li>将 SQLite 替换为 Postgres，Run 事件流替换为专业消息队列或日志流系统。</li>
+              <li>增强租户隔离：独立 OSS 前缀、短期凭证、细粒度 RBAC、Worker Token 轮换。</li>
+              <li>完善工作空间版本能力：删除、回滚、diff、提交、分支和大文件分片上传。</li>
+              <li>强化沙箱策略：禁网默认、allowlist、磁盘配额、运行时审计和高危命令审批。</li>
+              <li>扩展模型目录，让后端成为唯一模型能力和价格来源，前端不再硬编码模型列表。</li>
+            </ul>
+          </div>
+        </section>
+
+        <footer>
+          <p>本文档根据当前仓库源码整理，重点覆盖实际存在的模块、接口、配置和运行链路。文件位置：<code>docs/project-overview.html</code>。</p>
+        </footer>
+      </main>
+    </div>
+  </div>
+</body>
+</html>
