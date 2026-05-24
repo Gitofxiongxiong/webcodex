@@ -245,8 +245,8 @@ export class RuntimeShellExecutor {
   }
 
   async run(action) {
-    const timeoutMs = normalizeTimeoutMs(action?.timeoutMs);
-    const maxOutputLength = normalizeOutputLimit(action?.maxOutputLength);
+    const timeoutMs = normalizeTimeoutMs(action?.timeoutMs ?? action?.timeout_ms);
+    const maxOutputLength = normalizeOutputLimit(action?.maxOutputLength ?? action?.max_output_length);
     const commands = Array.isArray(action?.commands) ? action.commands : [];
     const output = [];
     for (const command of commands) {

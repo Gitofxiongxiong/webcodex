@@ -6,11 +6,13 @@ import OpenAI, { toFile } from "openai";
 const IMAGE_KINDS = new Set(["image"]);
 
 export class AttachmentClient {
-  constructor({ apiBaseUrl, workerToken, sandboxDir, openaiClient }) {
+  constructor({ apiBaseUrl, workerToken, sandboxDir, openaiClient, apiProtocol = "responses", relayMode = false, compatibilityMode = false }) {
     this.apiBaseUrl = apiBaseUrl.replace(/\/$/, "");
     this.workerToken = workerToken;
     this.sandboxDir = path.resolve(sandboxDir);
     this.openai = openaiClient;
+    this.apiProtocol = normalizeApiProtocol(apiProtocol);
+    this.relayMode = Boolean(relayMode || compatibilityMode);
   }
 
   async getRunInput(runId) {
@@ -39,7 +41,7 @@ export class AttachmentClient {
   }
 
   sessionInputCallback(historyItems, newItems) {
-    return [...historyItems, ...newItems.map(redactLargeInlineData)];
+    return [...historyItems, ...newItems];
   }
 
   async prepareAttachment({ runId, attachment }) {
@@ -47,10 +49,21 @@ export class AttachmentClient {
     const bytes = Buffer.from(data.content_base64, "base64");
     await this.writeSandboxAttachment(attachment, bytes);
 
+    if (this.relayMode) {
+      const preparedAttachment = this.compatiblePreparedAttachment(attachment, bytes);
+      const modelPart = this.modelPartForAttachment(preparedAttachment);
+      const includedAs = modelPart?.type ?? "tool_only";
+      await this.updateRunAttachment(runId, attachment.id, { included_as: includedAs });
+      return { attachment: preparedAttachment, modelPart, includedAs };
+    }
+
     try {
       const preparedAttachment = {
         ...attachment,
         openai_file_id: await this.ensureOpenAIFile(attachment, bytes),
+        ...(this.shouldInlineImageForModel(attachment)
+          ? { image_data_url: dataUrlForAttachment(attachment, bytes) }
+          : {}),
       };
       const modelPart = this.modelPartForAttachment(preparedAttachment);
       const includedAs = modelPart?.type ?? "tool_only";
@@ -73,7 +86,7 @@ export class AttachmentClient {
           : this.modelPartForAttachment({
             ...attachment,
             openai_file_id: "inline_file",
-            file_data: bytes.toString("base64"),
+            file_data: `data:${attachment.content_type || "application/octet-stream"};base64,${bytes.toString("base64")}`,
           }))
         : null;
       await this.updateRunAttachment(runId, attachment.id, {
@@ -147,6 +160,21 @@ export class AttachmentClient {
     };
   }
 
+  shouldInlineImageForModel(attachment) {
+    return (this.apiProtocol === "chat_completions" || this.relayMode) && IMAGE_KINDS.has(attachment.model_kind);
+  }
+
+  compatiblePreparedAttachment(attachment, bytes) {
+    if (!IMAGE_KINDS.has(attachment.model_kind)) {
+      return attachment;
+    }
+    return {
+      ...attachment,
+      openai_file_id: "inline_image",
+      image_data_url: dataUrlForAttachment(attachment, bytes),
+    };
+  }
+
   userTextWithAttachmentIndex(text, prepared) {
     const lines = [text.trim() || "Please analyze the attached files."];
     if (prepared.length) {
@@ -193,8 +221,8 @@ export class AttachmentClient {
   }
 }
 
-export function createOpenAIUploadClient() {
-  if (process.env.OPENAI_MODEL_PROVIDER === "codex-relay") {
+export function createOpenAIUploadClient({ uploadFiles = true } = {}) {
+  if (!uploadFiles) {
     return null;
   }
   const apiKey = process.env.OPENAI_API_KEY || "";
@@ -214,6 +242,18 @@ function purposeForAttachment(attachment) {
 
 function normalizeSandboxRelativePath(value) {
   return String(value || "attachment.bin").replaceAll("\\", "/").replace(/^\/+/, "");
+}
+
+function normalizeApiProtocol(value) {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/-/g, "_");
+  if (normalized === "chat" || normalized === "chat_completions") {
+    return "chat_completions";
+  }
+  return "responses";
+}
+
+function dataUrlForAttachment(attachment, bytes) {
+  return `data:${attachment.content_type || "application/octet-stream"};base64,${bytes.toString("base64")}`;
 }
 
 function dropUndefined(value) {

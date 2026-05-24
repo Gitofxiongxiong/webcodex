@@ -1,8 +1,9 @@
 import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
-import { math } from "@streamdown/math";
+import { createMathPlugin } from "@streamdown/math";
 import { Streamdown } from "streamdown";
 
+const math = createMathPlugin({ singleDollarTextMath: true });
 const plugins = { cjk, code, math };
 
 const translations = {

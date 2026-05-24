@@ -19,7 +19,7 @@ export function makeRuntimeWorkspaceTools({ runtime, apiBaseUrl, workerToken, wo
   const client = new WorkspaceApiClient({ apiBaseUrl, workerToken, workspaceId });
   const bridge = new WorkspaceBridge({ runtime, client });
 
-  return [
+  const tools = [
     tool({
       name: "workspace_tree",
       description: "List a bounded metadata-only tree from the current WebCodex workspace. Does not return file contents.",
@@ -54,7 +54,7 @@ export function makeRuntimeWorkspaceTools({ runtime, apiBaseUrl, workerToken, wo
     }),
     tool({
       name: "workspace_import",
-      description: "Import one or more current WebCodex workspace files into Docker /sandbox before using shell, apply_patch, or viewTool2.",
+      description: "Import one or more current WebCodex workspace files into Docker /sandbox before using shell or apply_patch.",
       parameters: z.object({
         files: z.array(z.object({
           workspace_path: z.string().min(1),
@@ -66,22 +66,27 @@ export function makeRuntimeWorkspaceTools({ runtime, apiBaseUrl, workerToken, wo
       errorFunction: formatToolError,
       timeoutMs: 60_000,
     }),
-    tool({
-      name: "workspace_export",
-      description: "Export one or more Docker /sandbox files back to the WebCodex workspace, creating workspace versions.",
-      parameters: z.object({
-        files: z.array(z.object({
-          sandbox_path: z.string().min(1).describe("Source path relative to Docker /sandbox, or an absolute path under /sandbox."),
-          workspace_path: z.string().min(1).optional(),
-          content_type: z.string().min(1).optional(),
-        })).min(1).max(MAX_EXPORT_FILES),
-        message: z.string().min(1).optional(),
-      }),
-      execute: async (args) => bridge.exportFiles(args),
-      errorFunction: formatToolError,
-      timeoutMs: 60_000,
-    }),
   ];
+  if (process.env.WORKER_ENABLE_WORKSPACE_EXPORT === "true") {
+    tools.push(
+      tool({
+        name: "workspace_export",
+        description: "Export one or more Docker /sandbox files back to the WebCodex workspace, creating workspace versions.",
+        parameters: z.object({
+          files: z.array(z.object({
+            sandbox_path: z.string().min(1).describe("Source path relative to Docker /sandbox, or an absolute path under /sandbox."),
+            workspace_path: z.string().min(1).optional(),
+            content_type: z.string().min(1).optional(),
+          })).min(1).max(MAX_EXPORT_FILES),
+          message: z.string().min(1).optional(),
+        }),
+        execute: async (args) => bridge.exportFiles(args),
+        errorFunction: formatToolError,
+        timeoutMs: 60_000,
+      })
+    );
+  }
+  return tools;
 }
 
 class WorkspaceBridge {

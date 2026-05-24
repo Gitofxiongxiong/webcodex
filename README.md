@@ -55,7 +55,10 @@ npm install
 
 Before starting the backend, choose one model credential path:
 
-- Official OpenAI API: fill `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL`. The fallback defaults are `OPENAI_MODEL=gpt-5.4`, `OPENAI_REASONING_EFFORT=xhigh`, `OPENAI_REASONING_SUMMARY=detailed`, and `OPENAI_SERVICE_TIER=priority`.
+- Official OpenAI API: fill `OPENAI_API_KEY`, leave `OPENAI_BASE_URL` empty unless you intentionally use a compatible `/v1` endpoint, and keep `OPENAI_API_PROTOCOL=responses`. The fallback defaults are `OPENAI_MODEL=gpt-5.5`, `OPENAI_REASONING_EFFORT=xhigh`, `OPENAI_REASONING_SUMMARY=detailed`, and `OPENAI_SERVICE_TIER=priority`.
+- new-api Codex Responses relay: fill `OPENAI_API_KEY`, set `OPENAI_BASE_URL` to the new-api `/v1` base URL, keep `OPENAI_API_PROTOCOL=responses`, and leave `OPENAI_PROVIDER_PROFILE=auto`. The backend labels this path as `new-api-codex` with the `codex-responses` profile, so it uses `/v1/responses` while avoiding upstream features that the relay rejects. Relay mode disables hosted web search, compaction, service-tier passthrough, non-image `input_file` payloads, and official `shell`/`apply_patch` wire tools unless explicitly forced. Set `OPENAI_RESPONSES_RELAY_MODE=false` only for an endpoint that fully implements the official Responses API.
+- Runtime command tools default to `WORKER_RUNTIME_TOOL_MODE=auto`, which resolves to official Agents SDK `shellTool`/`applyPatchTool` for official Responses API runs, and to Agents SDK function tools for Chat Completions or Codex/new-api relay compatibility. Set `WORKER_RUNTIME_TOOL_MODE=sdk` only when the upstream accepts official Responses `shell` and `apply_patch` tool definitions; set `WORKER_RUNTIME_TOOL_MODE=function` to force the compatibility path.
+- Responses API compaction uses the active run model directly. With the default catalog that means compaction runs on `gpt-5.5` and is billed through the same usage ledger.
 - Local Codex relay: leave `OPENAI_API_KEY` empty and keep `CODEX_RELAY_AUTH_FILE=../docs/auth.json`. The worker will use `CODEX_RELAY_MODEL` for this path.
 
 Also fill the Aliyun OSS access key, secret, endpoint, bucket, and fixed `OSS_KEY_PREFIX`.
@@ -159,5 +162,5 @@ Invoke-RestMethod `
 ## Demo Limitations
 
 - SQLite polling is used for SSE; this is fine for a demo and should be replaced by Redis/NATS/Kafka later.
-- Workspace tools operate through the Python API and text OSS blobs only; sandbox command execution is still a later phase.
+- Workspace indexing and persistence still go through the Python API and OSS blobs; agent command execution now runs in the local Docker sandbox configured by `WORKER_RUNTIME=docker`.
 - The worker token is a local demo secret from `.env.example`.

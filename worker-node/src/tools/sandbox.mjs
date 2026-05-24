@@ -20,7 +20,7 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
   return [
     tool({
       name: "sandbox_list",
-      description: "List files inside the current run sandbox. Paths are relative to the sandbox root.",
+      description: "List files inside the active sandbox. Paths are relative to the sandbox root.",
       parameters: z.object({
         path: z.string().optional(),
         recursive: z.boolean().optional(),
@@ -31,7 +31,7 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
     }),
     tool({
       name: "sandbox_read",
-      description: "Read a UTF-8 text file from the current run sandbox by sandbox-relative path.",
+      description: "Read a UTF-8 text file from the active sandbox by sandbox-relative path.",
       parameters: z.object({
         path: z.string().min(1),
       }),
@@ -41,7 +41,7 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
     }),
     tool({
       name: "sandbox_write",
-      description: "Create or overwrite a UTF-8 text file inside the current run sandbox. Use this for drafts, generated files, scripts, and tests before exporting to the workspace.",
+      description: "Create or overwrite a UTF-8 text file inside the active sandbox. Use this for drafts, generated files, scripts, and tests before exporting to the workspace.",
       parameters: z.object({
         path: z.string().min(1),
         content: z.string(),
@@ -52,7 +52,7 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
     }),
     tool({
       name: "sandbox_bash",
-      description: "Run a bash command in the current run sandbox directory and return stdout, stderr, and exit code. Use this for shell-based file operations and tests.",
+      description: "Run a bash command in the active sandbox directory and return stdout, stderr, and exit code. Use this for shell-based file operations and tests.",
       parameters: z.object({
         command: z.string().min(1),
         timeout_ms: z.number().int().min(1_000).max(MAX_TIMEOUT_MS).optional(),
@@ -69,7 +69,7 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
     }),
     tool({
       name: "sandbox_python",
-      description: "Run Python code in the current run sandbox directory and return stdout, stderr, and exit code. Use this for scripts, generation, parsing, and verification.",
+      description: "Run Python code in the active sandbox directory and return stdout, stderr, and exit code. Use this for scripts, generation, parsing, and verification.",
       parameters: z.object({
         code: z.string().min(1),
         timeout_ms: z.number().int().min(1_000).max(MAX_TIMEOUT_MS).optional(),
@@ -91,7 +91,7 @@ export function makeSandboxTools({ sandboxDir, apiBaseUrl, workerToken, workspac
     }),
     tool({
       name: "sandbox_curl",
-      description: "Fetch or inspect a URL with curl from the current run sandbox. Use this for HTTP APIs, exact URLs, headers, status codes, and response bodies.",
+      description: "Fetch or inspect a URL with curl from the active sandbox. Use this for HTTP APIs, exact URLs, headers, status codes, and response bodies.",
       parameters: z.object({
         url: z.url().refine((value) => isHttpUrl(value), "URL must use http or https"),
         method: z.string().min(1).max(16).optional(),
@@ -392,7 +392,7 @@ class Sandbox {
     const fullPath = path.resolve(this.root, raw);
     const relative = path.relative(this.root, fullPath);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`Sandbox path escapes the run sandbox: ${targetPath}`);
+      throw new Error(`Sandbox path escapes the active sandbox: ${targetPath}`);
     }
     return fullPath;
   }

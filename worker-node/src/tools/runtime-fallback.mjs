@@ -15,7 +15,7 @@ export function makeRuntimeFunctionTools({ runtime }) {
       parameters: z.object({
         commands: z.array(z.string().min(1)).min(1),
         timeout_ms: z.number().int().min(1_000).max(120_000).optional(),
-        max_output_length: z.number().int().min(1).max(24_000).optional(),
+        max_output_length: z.number().int().min(1).max(120_000).optional(),
       }),
       execute: async ({ commands, timeout_ms, max_output_length }) =>
         shell.run({

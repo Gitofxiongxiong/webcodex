@@ -8,10 +8,10 @@ const authStorageKey = "webcodex.auth";
 const h = React.createElement;
 
 const supportedModels = [
-  { value: "gpt-5.4", label: "GPT-5.4" },
   { value: "gpt-5.5", label: "GPT-5.5" },
 ];
 const supportedModelValues = new Set(supportedModels.map((item) => item.value));
+const defaultModel = supportedModels[0]?.value ?? "gpt-5.5";
 const reasoningOptions = ["low", "medium", "high", "xhigh"];
 const speedOptions = [
   { value: "fast", label: "Fast" },
@@ -42,7 +42,6 @@ const eventTypes = [
   "codex.patch.completed",
   "codex.file.changed",
   "workspace.version.created",
-  "artifact.preview",
   "run.completed",
   "run.failed",
   "run.cancelled",
@@ -56,7 +55,7 @@ function App() {
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("就绪");
-  const [model, setModel] = useState("gpt-5.4");
+  const [model, setModel] = useState(defaultModel);
   const [reasoningEffort, setReasoningEffort] = useState("xhigh");
   const [speedMode, setSpeedMode] = useState("fast");
   const [usagePanel, setUsagePanel] = useState(null);
@@ -531,7 +530,7 @@ function App() {
       setUsagePanel((current) => usagePanelFromEstimate(event.payload, current));
     } else if (event.type === "model.usage") {
       setUsagePanel((current) => usagePanelFromModelUsage(event.payload, current));
-    } else if (event.type.startsWith("tool.call.") || event.type.startsWith("codex.") || event.type === "workspace.version.created" || event.type === "artifact.preview") {
+    } else if (event.type.startsWith("tool.call.") || event.type.startsWith("codex.") || event.type === "workspace.version.created") {
       updateTool(assistantId, event);
     } else if (event.type === "run.completed") {
       updateAssistant(assistantId, { streaming: false });
@@ -796,7 +795,7 @@ function App() {
       };
       const next = {
         ...current,
-        name: event.payload?.name ?? displayEventName(event.type, current.name),
+        name: event.payload?.displayName ?? event.payload?.name ?? displayEventName(event.type, current.name),
         status: event.status ?? statusFromEventType(event.type),
         detail: toolDetail(current.detail, event),
       };
@@ -1388,7 +1387,7 @@ function Header({ title, status, usage, modelCatalog, showWorkspaceAction = fals
 }
 
 function RuntimeControls({ model, reasoningEffort, speedMode, onModel, onReasoning, onSpeed }) {
-  const normalizedModel = supportedModelValues.has(model) ? model : "gpt-5.4";
+  const normalizedModel = supportedModelValues.has(model) ? model : defaultModel;
   useEffect(() => {
     if (normalizedModel !== model) {
       onModel(normalizedModel);
@@ -2426,18 +2425,17 @@ function toolBlocks(blocks) {
 
 function displayEventName(type, fallback) {
   const labels = {
-    "codex.command.started": "shell",
-    "codex.command.completed": "shell",
+    "codex.command.started": "bash (/sandbox)",
+    "codex.command.completed": "bash (/sandbox)",
     "codex.patch.started": "apply_patch",
     "codex.patch.completed": "apply_patch",
     "workspace.version.created": "workspace_export",
-    "artifact.preview": "viewTool2",
   };
   return labels[type] ?? fallback ?? "工具调用";
 }
 
 function statusFromEventType(type) {
-  if (type.endsWith(".completed") || type === "workspace.version.created" || type === "artifact.preview") {
+  if (type.endsWith(".completed") || type === "workspace.version.created") {
     return "completed";
   }
   if (type.endsWith(".failed")) {
@@ -2516,9 +2514,6 @@ function toolDetail(previous, event) {
       versionId: event.payload?.versionId,
       exported: event.payload?.exported,
     });
-  }
-  if (event.type === "artifact.preview") {
-    return formatPayload(event.payload?.preview ?? event.payload ?? {});
   }
   return formatPayload(event.payload ?? {});
 }

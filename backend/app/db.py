@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import threading
@@ -54,6 +55,18 @@ class DemoStore:
                     current_version_id TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS agent_credentials (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    key_prefix TEXT NOT NULL,
+                    key_hash TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    last_used_at TEXT,
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 );
 
@@ -137,12 +150,19 @@ class DemoStore:
                 CREATE TABLE IF NOT EXISTS runs (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
+                    user_id TEXT,
+                    agent_credential_id TEXT,
                     status TEXT NOT NULL,
                     user_message TEXT NOT NULL,
                     input_json TEXT,
+                    settings_json TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+                    started_at TEXT,
+                    finished_at TEXT,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id),
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    FOREIGN KEY(agent_credential_id) REFERENCES agent_credentials(id)
                 );
 
                 CREATE TABLE IF NOT EXISTS attachments (
@@ -226,6 +246,8 @@ class DemoStore:
                 CREATE TABLE IF NOT EXISTS model_usage_events (
                     id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
+                    user_id TEXT,
+                    agent_credential_id TEXT,
                     call_id TEXT NOT NULL,
                     call_index INTEGER,
                     source TEXT NOT NULL,
@@ -252,7 +274,33 @@ class DemoStore:
                     payload_json TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     UNIQUE(run_id, call_id, source),
-                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                    FOREIGN KEY(run_id) REFERENCES runs(id),
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    FOREIGN KEY(agent_credential_id) REFERENCES agent_credentials(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS billing_ledger (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    agent_credential_id TEXT,
+                    run_id TEXT NOT NULL,
+                    usage_event_id TEXT,
+                    source TEXT NOT NULL,
+                    model TEXT,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost_micro_usd INTEGER,
+                    cost_micro_credits INTEGER,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(run_id, usage_event_id),
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    FOREIGN KEY(agent_credential_id) REFERENCES agent_credentials(id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id),
+                    FOREIGN KEY(usage_event_id) REFERENCES model_usage_events(id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_workspace_files_current
@@ -266,6 +314,12 @@ class DemoStore:
 
                 CREATE INDEX IF NOT EXISTS idx_file_ops_workspace_version
                     ON file_ops(workspace_id, version_id);
+
+                CREATE INDEX IF NOT EXISTS idx_workspaces_user
+                    ON workspaces(user_id);
+
+                CREATE INDEX IF NOT EXISTS idx_agent_credentials_user
+                    ON agent_credentials(user_id, status, created_at);
 
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation
                     ON messages(conversation_id, created_at);
@@ -290,9 +344,15 @@ class DemoStore:
 
                 CREATE INDEX IF NOT EXISTS idx_model_usage_events_run
                     ON model_usage_events(run_id, call_index, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_billing_ledger_user
+                    ON billing_ledger(user_id, agent_credential_id, created_at);
                 """
             )
             self._migrate_user_auth_columns(conn)
+            self._migrate_single_workspace(conn)
+            self._migrate_agent_credentials(conn)
+            self._migrate_run_columns(conn)
             self._migrate_usage_columns(conn)
             self._migrate_multimodal_columns(conn)
 
@@ -310,12 +370,192 @@ class DemoStore:
             """
         )
 
+    def _migrate_single_workspace(self, conn: sqlite3.Connection) -> None:
+        duplicates = conn.execute(
+            """
+            SELECT user_id
+            FROM workspaces
+            GROUP BY user_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for duplicate in duplicates:
+            user_id = duplicate["user_id"]
+            preferred_id = f"workspace_{user_id}"
+            canonical = conn.execute(
+                """
+                SELECT
+                    w.*,
+                    (
+                        SELECT COUNT(*)
+                        FROM conversations c
+                        WHERE c.workspace_id = w.id
+                    ) AS conversation_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM attachments a
+                        WHERE a.workspace_id = w.id
+                    ) AS attachment_count,
+                    (
+                        SELECT COUNT(*)
+                        FROM workspace_files wf
+                        WHERE wf.workspace_id = w.id
+                            AND wf.version_id = w.current_version_id
+                            AND wf.deleted = 0
+                    ) AS file_count
+                FROM workspaces w
+                WHERE user_id = ?
+                ORDER BY
+                    (conversation_count + attachment_count + file_count) DESC,
+                    CASE WHEN id = ? THEN 0 ELSE 1 END,
+                    updated_at DESC,
+                    created_at DESC,
+                    rowid DESC
+                LIMIT 1
+                """,
+                (user_id, preferred_id),
+            ).fetchone()
+            if not canonical:
+                continue
+            canonical_id = canonical["id"]
+            extras = conn.execute(
+                """
+                SELECT id
+                FROM workspaces
+                WHERE user_id = ? AND id <> ?
+                """,
+                (user_id, canonical_id),
+            ).fetchall()
+            for extra in extras:
+                extra_id = extra["id"]
+                conn.execute("UPDATE conversations SET workspace_id = ? WHERE workspace_id = ?", (canonical_id, extra_id))
+                conn.execute("UPDATE attachments SET workspace_id = ? WHERE workspace_id = ?", (canonical_id, extra_id))
+                conn.execute("UPDATE workspace_versions SET workspace_id = ? WHERE workspace_id = ?", (canonical_id, extra_id))
+                conn.execute("UPDATE workspace_files SET workspace_id = ? WHERE workspace_id = ?", (canonical_id, extra_id))
+                conn.execute("UPDATE workspace_folders SET workspace_id = ? WHERE workspace_id = ?", (canonical_id, extra_id))
+                conn.execute("UPDATE file_ops SET workspace_id = ? WHERE workspace_id = ?", (canonical_id, extra_id))
+                conn.execute("DELETE FROM workspaces WHERE id = ?", (extra_id,))
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_user_unique
+                ON workspaces(user_id)
+            """
+        )
+
+    def _migrate_agent_credentials(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_credentials_key_hash
+                ON agent_credentials(key_hash)
+            """
+        )
+        user_rows = conn.execute("SELECT id FROM users").fetchall()
+        for user in user_rows:
+            user_id = user["id"]
+            existing = conn.execute(
+                """
+                SELECT 1
+                FROM agent_credentials
+                WHERE user_id = ? AND status = 'active'
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if existing:
+                continue
+            synthetic_secret = f"legacy:{user_id}"
+            key_hash = hashlib.sha256(synthetic_secret.encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO agent_credentials(id, user_id, name, key_prefix, key_hash, status)
+                VALUES (?, ?, 'Default agent credential', ?, ?, 'active')
+                """,
+                (f"cred_{uuid.uuid4().hex}", user_id, "wcx_legacy", key_hash),
+            )
+
+    def _migrate_run_columns(self, conn: sqlite3.Connection) -> None:
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if run_columns and "user_id" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN user_id TEXT")
+        if run_columns and "agent_credential_id" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN agent_credential_id TEXT")
+        if run_columns and "settings_json" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN settings_json TEXT")
+        if run_columns and "started_at" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN started_at TEXT")
+        if run_columns and "finished_at" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN finished_at TEXT")
+
+        conn.execute(
+            """
+            UPDATE runs
+            SET user_id = (
+                SELECT c.user_id
+                FROM conversations c
+                WHERE c.id = runs.conversation_id
+            )
+            WHERE user_id IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE runs
+            SET agent_credential_id = (
+                SELECT ac.id
+                FROM agent_credentials ac
+                WHERE ac.user_id = runs.user_id AND ac.status = 'active'
+                ORDER BY ac.created_at ASC
+                LIMIT 1
+            )
+            WHERE agent_credential_id IS NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runs_status_created
+                ON runs(status, created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_runs_user
+                ON runs(user_id, agent_credential_id, created_at)
+            """
+        )
+
     def _migrate_usage_columns(self, conn: sqlite3.Connection) -> None:
         model_usage_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(model_usage_events)").fetchall()
         }
         if model_usage_columns and "cost_micro_credits" not in model_usage_columns:
             conn.execute("ALTER TABLE model_usage_events ADD COLUMN cost_micro_credits INTEGER")
+        if model_usage_columns and "user_id" not in model_usage_columns:
+            conn.execute("ALTER TABLE model_usage_events ADD COLUMN user_id TEXT")
+        if model_usage_columns and "agent_credential_id" not in model_usage_columns:
+            conn.execute("ALTER TABLE model_usage_events ADD COLUMN agent_credential_id TEXT")
+        if model_usage_columns:
+            conn.execute(
+                """
+                UPDATE model_usage_events
+                SET user_id = (
+                        SELECT r.user_id
+                        FROM runs r
+                        WHERE r.id = model_usage_events.run_id
+                    ),
+                    agent_credential_id = (
+                        SELECT r.agent_credential_id
+                        FROM runs r
+                        WHERE r.id = model_usage_events.run_id
+                    )
+                WHERE user_id IS NULL OR agent_credential_id IS NULL
+                """
+            )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_model_usage_events_user
+                ON model_usage_events(user_id, agent_credential_id, created_at)
+            """
+        )
 
     def _migrate_multimodal_columns(self, conn: sqlite3.Connection) -> None:
         message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
@@ -360,6 +600,70 @@ class DemoStore:
                 raise ValueError("Account already exists") from exc
             row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return dict(row)
+
+    def create_agent_credential(
+        self,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        name: str = "Default agent credential",
+    ) -> dict[str, Any]:
+        credential_id = f"cred_{uuid.uuid4().hex}"
+        with self._lock, self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+                raise ValueError("User not found")
+            conn.execute(
+                """
+                INSERT INTO agent_credentials(id, user_id, name, key_prefix, key_hash, status)
+                VALUES (?, ?, ?, ?, ?, 'active')
+                """,
+                (credential_id, user_id, name, key_prefix, key_hash),
+            )
+            row = conn.execute("SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)).fetchone()
+        return dict(row)
+
+    def ensure_agent_credential(self, user_id: str) -> dict[str, Any]:
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM agent_credentials
+                WHERE user_id = ? AND status = 'active'
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if row:
+                return dict(row)
+            if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+                raise ValueError("User not found")
+            synthetic_secret = f"legacy:{user_id}"
+            key_hash = hashlib.sha256(synthetic_secret.encode("utf-8")).hexdigest()
+            credential_id = f"cred_{uuid.uuid4().hex}"
+            conn.execute(
+                """
+                INSERT INTO agent_credentials(id, user_id, name, key_prefix, key_hash, status)
+                VALUES (?, ?, 'Default agent credential', ?, ?, 'active')
+                """,
+                (credential_id, user_id, "wcx_legacy", key_hash),
+            )
+            row = conn.execute("SELECT * FROM agent_credentials WHERE id = ?", (credential_id,)).fetchone()
+        return dict(row)
+
+    def list_agent_credentials(self, user_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, name, key_prefix, status, created_at, last_used_at
+                FROM agent_credentials
+                WHERE user_id = ?
+                ORDER BY created_at ASC
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_user_by_account(self, account: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -415,6 +719,9 @@ class DemoStore:
                 """,
                 (user_id, user_id),
             )
+            user_workspace = conn.execute("SELECT * FROM workspaces WHERE user_id = ?", (user_id,)).fetchone()
+            if user_workspace:
+                return dict(user_workspace)
             workspace = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
             if workspace:
                 if workspace["user_id"] != user_id:
@@ -440,35 +747,7 @@ class DemoStore:
         return dict(row)
 
     def create_workspace(self, user_id: str, workspace_id: str, name: str) -> dict[str, Any]:
-        with self._lock, self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO users(id, name)
-                VALUES (?, ?)
-                ON CONFLICT(id) DO NOTHING
-                """,
-                (user_id, user_id),
-            )
-            if conn.execute("SELECT 1 FROM workspaces WHERE id = ?", (workspace_id,)).fetchone():
-                raise ValueError("Workspace already exists")
-
-            version_id = f"ver_{uuid.uuid4().hex}"
-            conn.execute(
-                """
-                INSERT INTO workspaces(id, user_id, name, current_version_id)
-                VALUES (?, ?, ?, ?)
-                """,
-                (workspace_id, user_id, name, version_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO workspace_versions(id, workspace_id, parent_version_id, message)
-                VALUES (?, ?, NULL, 'initial workspace')
-                """,
-                (version_id, workspace_id),
-            )
-            row = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
-        return dict(row)
+        return self.ensure_workspace(user_id=user_id, workspace_id=workspace_id, name=name)
 
     def get_workspace(self, workspace_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -947,7 +1226,10 @@ class DemoStore:
         self,
         run_id: str,
         conversation_id: str,
+        user_id: str,
+        agent_credential_id: str,
         user_message: str,
+        run_settings: dict[str, Any] | None = None,
         input_payload: dict[str, Any] | None = None,
         attachments: list[dict[str, Any]] | None = None,
     ) -> str:
@@ -957,12 +1239,43 @@ class DemoStore:
             conversation = conn.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
             if not conversation:
                 raise ValueError("Conversation not found")
+            if conversation["user_id"] != user_id:
+                raise ValueError("Conversation belongs to another user")
+            credential = conn.execute(
+                """
+                SELECT *
+                FROM agent_credentials
+                WHERE id = ? AND user_id = ? AND status = 'active'
+                """,
+                (agent_credential_id, user_id),
+            ).fetchone()
+            if not credential:
+                raise ValueError("Agent credential not found")
             conn.execute(
                 """
-                INSERT INTO runs(id, conversation_id, status, user_message, input_json)
-                VALUES (?, ?, 'queued', ?, ?)
+                INSERT INTO runs(
+                    id, conversation_id, user_id, agent_credential_id, status,
+                    user_message, input_json, settings_json
+                )
+                VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
-                (run_id, conversation_id, user_message, json.dumps(payload, ensure_ascii=False)),
+                (
+                    run_id,
+                    conversation_id,
+                    user_id,
+                    agent_credential_id,
+                    user_message,
+                    json.dumps(payload, ensure_ascii=False),
+                    json.dumps(run_settings or {}, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE agent_credentials
+                SET last_used_at = datetime('now')
+                WHERE id = ?
+                """,
+                (agent_credential_id,),
             )
             message_id = f"msg_{uuid.uuid4().hex}"
             conn.execute(
@@ -1009,11 +1322,17 @@ class DemoStore:
             )
 
     def set_run_status(self, run_id: str, status: str) -> None:
+        extra_assignments = []
+        if status == "running":
+            extra_assignments.append("started_at = COALESCE(started_at, datetime('now'))")
+        if status in {"completed", "failed", "cancelled"}:
+            extra_assignments.append("finished_at = COALESCE(finished_at, datetime('now'))")
+        extra_sql = f", {', '.join(extra_assignments)}" if extra_assignments else ""
         with self._lock, self.connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE runs
-                SET status = ?, updated_at = datetime('now')
+                SET status = ?, updated_at = datetime('now'){extra_sql}
                 WHERE id = ?
                 """,
                 (status, run_id),
@@ -1022,7 +1341,69 @@ class DemoStore:
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        return dict(row) if row else None
+        return self._run_from_row(row) if row else None
+
+    def claim_next_queued_run(self) -> dict[str, Any] | None:
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT r.*, c.workspace_id
+                FROM runs r
+                JOIN conversations c ON c.id = r.conversation_id
+                WHERE r.status = 'queued'
+                ORDER BY r.created_at ASC, r.rowid ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            claimed_marker = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'starting', updated_at = datetime('now'), started_at = COALESCE(started_at, datetime('now'))
+                WHERE id = ? AND status = 'queued'
+                RETURNING id
+                """,
+                (row["id"],),
+            ).fetchone()
+            if not claimed_marker:
+                return None
+            claimed = conn.execute(
+                """
+                SELECT r.*, c.workspace_id
+                FROM runs r
+                JOIN conversations c ON c.id = r.conversation_id
+                WHERE r.id = ?
+                """,
+                (row["id"],),
+            ).fetchone()
+        return self._run_from_row(claimed) if claimed else None
+
+    def get_active_run_for_conversation(self, conversation_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM runs
+                WHERE conversation_id = ?
+                    AND status NOT IN ('completed', 'failed', 'cancelled')
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return self._run_from_row(row) if row else None
+
+    def requeue_starting_runs(self) -> int:
+        with self._lock, self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'queued', updated_at = datetime('now')
+                WHERE status = 'starting'
+                """
+            )
+            return cursor.rowcount
 
     def append_message(
         self,
@@ -1090,7 +1471,7 @@ class DemoStore:
         with self.connect() as conn:
             row = conn.execute(
                 """
-                SELECT r.*, c.workspace_id, c.user_id
+                SELECT r.*, c.workspace_id, c.user_id AS conversation_user_id
                 FROM runs r
                 JOIN conversations c ON c.id = r.conversation_id
                 WHERE r.id = ?
@@ -1313,18 +1694,26 @@ class DemoStore:
         breakdown = payload.get("breakdown") if isinstance(payload.get("breakdown"), list) else []
 
         with self._lock, self.connect() as conn:
+            run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if not run:
+                raise ValueError("Run not found")
+            user_id = run["user_id"]
+            agent_credential_id = run["agent_credential_id"]
+            event_id = f"usage_{uuid.uuid4().hex}"
             conn.execute(
                 """
                 INSERT INTO model_usage_events(
-                    id, run_id, call_id, call_index, source, mode, visibility, model, service_tier,
+                    id, run_id, user_id, agent_credential_id, call_id, call_index, source, mode, visibility, model, service_tier,
                     response_id, request_id, input_tokens, cached_tokens, output_tokens,
                     reasoning_tokens, total_tokens, context_window, reserved_output_tokens,
                     usable_context_tokens, remaining_tokens, used_percent, cost_micro_usd,
                     cost_micro_credits,
                     pricing_json, prompt_breakdown_json, payload_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(run_id, call_id, source) DO UPDATE SET
+                    user_id = excluded.user_id,
+                    agent_credential_id = excluded.agent_credential_id,
                     call_index = excluded.call_index,
                     mode = excluded.mode,
                     visibility = excluded.visibility,
@@ -1350,8 +1739,10 @@ class DemoStore:
                     created_at = datetime('now')
                 """,
                 (
-                    f"usage_{uuid.uuid4().hex}",
+                    event_id,
                     run_id,
+                    user_id,
+                    agent_credential_id,
                     call_id,
                     self._int_or_none(payload.get("callIndex")),
                     source,
@@ -1378,6 +1769,122 @@ class DemoStore:
                     json.dumps(payload, ensure_ascii=False),
                 ),
             )
+            row = conn.execute(
+                """
+                SELECT id
+                FROM model_usage_events
+                WHERE run_id = ? AND call_id = ? AND source = ?
+                """,
+                (run_id, call_id, source),
+            ).fetchone()
+            should_bill = False
+            if source == "responses.compact":
+                should_bill = True
+            elif source == "provider-usage":
+                conn.execute(
+                    "DELETE FROM billing_ledger WHERE run_id = ? AND source = 'response.completed'",
+                    (run_id,),
+                )
+                should_bill = True
+            elif source == "response.completed":
+                should_bill = not conn.execute(
+                    """
+                    SELECT 1
+                    FROM billing_ledger
+                    WHERE run_id = ? AND source = 'provider-usage'
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+            else:
+                should_bill = not conn.execute(
+                    """
+                    SELECT 1
+                    FROM billing_ledger
+                    WHERE run_id = ? AND source IN ('provider-usage', 'response.completed')
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+            if row and should_bill:
+                self._upsert_billing_ledger(
+                    conn,
+                    usage_event_id=row["id"],
+                    run_id=run_id,
+                    user_id=user_id,
+                    agent_credential_id=agent_credential_id,
+                    source=source,
+                    model=self._str_or_none(payload.get("model")),
+                    input_tokens=input_tokens,
+                    cached_tokens=cached_tokens,
+                    output_tokens=output_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    total_tokens=total_tokens,
+                    cost_micro_usd=self._int_or_none(payload.get("costMicroUsd")),
+                    cost_micro_credits=self._int_or_none(payload.get("costMicroCredits")),
+                    payload=payload,
+                )
+
+    def _upsert_billing_ledger(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        usage_event_id: str,
+        run_id: str,
+        user_id: str,
+        agent_credential_id: str | None,
+        source: str,
+        model: str | None,
+        input_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        total_tokens: int,
+        cost_micro_usd: int | None,
+        cost_micro_credits: int | None,
+        payload: dict[str, Any],
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO billing_ledger(
+                id, user_id, agent_credential_id, run_id, usage_event_id, source, model,
+                input_tokens, cached_tokens, output_tokens, reasoning_tokens, total_tokens,
+                cost_micro_usd, cost_micro_credits, payload_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(run_id, usage_event_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                agent_credential_id = excluded.agent_credential_id,
+                source = excluded.source,
+                model = excluded.model,
+                input_tokens = excluded.input_tokens,
+                cached_tokens = excluded.cached_tokens,
+                output_tokens = excluded.output_tokens,
+                reasoning_tokens = excluded.reasoning_tokens,
+                total_tokens = excluded.total_tokens,
+                cost_micro_usd = excluded.cost_micro_usd,
+                cost_micro_credits = excluded.cost_micro_credits,
+                payload_json = excluded.payload_json,
+                created_at = datetime('now')
+            """,
+            (
+                f"bill_{uuid.uuid4().hex}",
+                user_id,
+                agent_credential_id,
+                run_id,
+                usage_event_id,
+                source,
+                model,
+                input_tokens,
+                cached_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+                cost_micro_usd,
+                cost_micro_credits,
+                json.dumps(payload, ensure_ascii=False),
+            ),
+        )
 
     def get_context_snapshot(self, run_id: str, call_id: str | None = None) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -1420,6 +1927,69 @@ class DemoStore:
                 (run_id,),
             ).fetchall()
         return [self._model_usage_from_row(row) for row in rows]
+
+    def get_user_usage_summary(
+        self,
+        user_id: str,
+        agent_credential_id: str | None = None,
+    ) -> dict[str, Any]:
+        filters = ["user_id = ?"]
+        params: list[Any] = [user_id]
+        if agent_credential_id:
+            filters.append("agent_credential_id = ?")
+            params.append(agent_credential_id)
+        where = " AND ".join(filters)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS requests,
+                    COUNT(DISTINCT run_id) AS runs,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    SUM(cost_micro_usd) AS cost_micro_usd,
+                    SUM(cost_micro_credits) AS cost_micro_credits
+                FROM billing_ledger
+                WHERE {where}
+                """,
+                tuple(params),
+            ).fetchone()
+            recent_rows = conn.execute(
+                f"""
+                SELECT id, agent_credential_id, run_id, source, model, input_tokens,
+                    cached_tokens, output_tokens, reasoning_tokens, total_tokens,
+                    cost_micro_usd, cost_micro_credits, created_at
+                FROM billing_ledger
+                WHERE {where}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 50
+                """,
+                tuple(params),
+            ).fetchall()
+
+        cost_micro_usd = row["cost_micro_usd"] if row else None
+        cost_micro_credits = row["cost_micro_credits"] if row else None
+        return {
+            "userId": user_id,
+            "agentCredentialId": agent_credential_id,
+            "totals": {
+                "requests": int(row["requests"] if row else 0),
+                "runs": int(row["runs"] if row else 0),
+                "inputTokens": int(row["input_tokens"] if row else 0),
+                "cachedTokens": int(row["cached_tokens"] if row else 0),
+                "outputTokens": int(row["output_tokens"] if row else 0),
+                "reasoningTokens": int(row["reasoning_tokens"] if row else 0),
+                "totalTokens": int(row["total_tokens"] if row else 0),
+                "costMicroUsd": cost_micro_usd,
+                "costUsd": round(cost_micro_usd / 1_000_000, 6) if cost_micro_usd is not None else None,
+                "costMicroCredits": cost_micro_credits,
+                "costCredits": round(cost_micro_credits / 1_000_000, 6) if cost_micro_credits is not None else None,
+            },
+            "recent": [self._billing_ledger_from_row(item) for item in recent_rows],
+        }
 
     def get_run_usage_summary(self, run_id: str) -> dict[str, Any]:
         usage_events = self.list_model_usage_events(run_id)
@@ -1898,6 +2468,12 @@ class DemoStore:
             "payload": json.loads(row["payload_json"]),
         }
 
+    def _run_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["settings"] = self._json_or_none(item.get("settings_json")) or {}
+        item["input"] = self._json_or_none(item.get("input_json")) or {}
+        return item
+
     def _context_snapshot_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "runId": row["run_id"],
@@ -1923,6 +2499,8 @@ class DemoStore:
         cost_micro_credits = row["cost_micro_credits"]
         return {
             "runId": row["run_id"],
+            "userId": row["user_id"],
+            "agentCredentialId": row["agent_credential_id"],
             "callId": row["call_id"],
             "callIndex": row["call_index"],
             "source": row["source"],
@@ -1949,6 +2527,27 @@ class DemoStore:
             "pricing": json.loads(row["pricing_json"]),
             "breakdown": json.loads(row["prompt_breakdown_json"]),
             "payload": json.loads(row["payload_json"]),
+            "createdAt": row["created_at"],
+        }
+
+    def _billing_ledger_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        cost_micro_usd = row["cost_micro_usd"]
+        cost_micro_credits = row["cost_micro_credits"]
+        return {
+            "id": row["id"],
+            "agentCredentialId": row["agent_credential_id"],
+            "runId": row["run_id"],
+            "source": row["source"],
+            "model": row["model"],
+            "inputTokens": row["input_tokens"],
+            "cachedTokens": row["cached_tokens"],
+            "outputTokens": row["output_tokens"],
+            "reasoningTokens": row["reasoning_tokens"],
+            "totalTokens": row["total_tokens"],
+            "costMicroUsd": cost_micro_usd,
+            "costUsd": round(cost_micro_usd / 1_000_000, 6) if cost_micro_usd is not None else None,
+            "costMicroCredits": cost_micro_credits,
+            "costCredits": round(cost_micro_credits / 1_000_000, 6) if cost_micro_credits is not None else None,
             "createdAt": row["created_at"],
         }
 

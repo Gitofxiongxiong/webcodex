@@ -14,10 +14,10 @@ const sidebarHistoryLimit = 5;
 const folderMarkerFile = ".webcodex-folder";
 
 const supportedModels = [
-  { value: "gpt-5.4", label: "GPT-5.4" },
   { value: "gpt-5.5", label: "GPT-5.5" },
 ];
 const supportedModelValues = new Set(supportedModels.map((item) => item.value));
+const defaultModel = supportedModels[0]?.value ?? "gpt-5.5";
 const reasoningOptions = ["low", "medium", "high", "xhigh"];
 const speedOptions = [
   { value: "fast", label: "Fast" },
@@ -48,7 +48,7 @@ const eventTypes = [
   "codex.patch.completed",
   "codex.file.changed",
   "workspace.version.created",
-  "artifact.preview",
+  "sandbox.exports.created",
   "run.completed",
   "run.failed",
   "run.cancelled",
@@ -62,10 +62,11 @@ function App() {
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("就绪");
-  const [model, setModel] = useState("gpt-5.4");
+  const [model, setModel] = useState(defaultModel);
   const [reasoningEffort, setReasoningEffort] = useState("xhigh");
   const [speedMode, setSpeedMode] = useState("fast");
   const [usagePanel, setUsagePanel] = useState(null);
+  const [billingUsage, setBillingUsage] = useState(null);
   const [modelCatalog, setModelCatalog] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [view, setView] = useState("chat");
@@ -76,12 +77,18 @@ function App() {
   const [workspaceFilesLoading, setWorkspaceFilesLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [workspaceTreeOpen, setWorkspaceTreeOpen] = useState(false);
+  const [attachments, setAttachments] = useState([]);
+  const [attachmentUploading, setAttachmentUploading] = useState(false);
+  const [dragActive, setDragActive] = useState(false);
   const sourceRef = useRef(null);
   const activeAssistantIdRef = useRef(null);
   const currentRunIdRef = useRef(null);
+  const eventSeqRef = useRef(0);
   const cancelRequestedRef = useRef(false);
   const messagesRef = useRef(null);
   const inputRef = useRef(null);
+  const composerFileInputRef = useRef(null);
+  const composerDragDepthRef = useRef(0);
   const token = auth?.token ?? "";
   const workspaceId = auth?.workspace?.id ?? "";
 
@@ -95,7 +102,7 @@ function App() {
       return undefined;
     }
     refreshCurrentUser()
-      .then(() => Promise.all([refreshConversations(), refreshWorkspaces()]))
+      .then(() => Promise.all([refreshConversations(), refreshWorkspaces(), loadBillingUsage()]))
       .catch((error) => pushNotice(error.message));
     loadModelCatalog().catch((error) => pushNotice(error.message));
     return () => sourceRef.current?.close();
@@ -106,12 +113,15 @@ function App() {
       sourceRef.current?.close();
       activeAssistantIdRef.current = null;
       currentRunIdRef.current = null;
+      eventSeqRef.current = 0;
       cancelRequestedRef.current = false;
       setConversationId(null);
       setConversations([]);
       setMessages([]);
+      setAttachments([]);
       setRunning(false);
       setUsagePanel(null);
+      setBillingUsage(null);
       setModelCatalog(null);
       setView("chat");
       setWorkspaces([]);
@@ -121,6 +131,9 @@ function App() {
       setWorkspaceFilesLoading(false);
       setWorkspaceError("");
       setWorkspaceTreeOpen(false);
+      setAttachments([]);
+      setAttachmentUploading(false);
+      setDragActive(false);
       setStatus("就绪");
     }
   }, [token]);
@@ -152,6 +165,25 @@ function App() {
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
+  useEffect(() => {
+    function handleWindowPaste(event) {
+      if (!token || view !== "chat" || running) {
+        return;
+      }
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+      const files = filesFromClipboard(event.clipboardData);
+      if (!files.length) {
+        return;
+      }
+      event.preventDefault();
+      handleComposerFiles(files);
+    }
+    window.addEventListener("paste", handleWindowPaste);
+    return () => window.removeEventListener("paste", handleWindowPaste);
+  }, [token, view, running, workspaceId, attachments.length]);
+
   if (!token) {
     return h(AuthGate, { onAuthenticated: handleAuthenticated });
   }
@@ -174,7 +206,11 @@ function App() {
     setConversationId(null);
     setConversations([]);
     setMessages([]);
+    eventSeqRef.current = 0;
     setView("chat");
+    setAttachments([]);
+    setAttachmentUploading(false);
+    setDragActive(false);
   }
 
   async function refreshCurrentUser() {
@@ -195,6 +231,16 @@ function App() {
       throw new Error(body.detail ?? "Failed to load model catalog");
     }
     setModelCatalog(body);
+  }
+
+  async function loadBillingUsage() {
+    const response = await apiFetch("/api/billing/usage");
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(body.detail ?? "Failed to load billing usage");
+    }
+    setBillingUsage(body);
+    return body;
   }
 
   async function logout() {
@@ -324,6 +370,103 @@ function App() {
     return body;
   }
 
+  async function uploadChatAttachments(fileList) {
+    const files = Array.from(fileList ?? []).filter(Boolean);
+    if (!workspaceId || files.length === 0) {
+      return [];
+    }
+    const remaining = Math.max(0, 20 - attachments.length);
+    const selected = files.slice(0, remaining);
+    if (!selected.length) {
+      pushNotice("每条消息最多上传 20 个文件");
+      return [];
+    }
+    const formData = new FormData();
+    for (const file of selected) {
+      formData.append("files", file);
+    }
+    setAttachmentUploading(true);
+    try {
+      const params = new URLSearchParams({ workspace_id: workspaceId });
+      const response = await apiFetch(`/api/attachments?${params}`, {
+        method: "POST",
+        body: formData,
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        throw new Error(body.detail ?? "上传附件失败");
+      }
+      const uploaded = body.attachments ?? [];
+      setAttachments((items) => [...items, ...uploaded].slice(0, 20));
+      await Promise.all([refreshWorkspaceFiles(workspaceId), refreshWorkspaces()]);
+      return uploaded;
+    } finally {
+      setAttachmentUploading(false);
+    }
+  }
+
+  async function handleComposerFiles(fileList) {
+    try {
+      await uploadChatAttachments(fileList);
+    } catch (error) {
+      pushNotice(error.message);
+    }
+  }
+
+  function removeAttachment(attachmentId) {
+    setAttachments((items) => items.filter((item) => item.id !== attachmentId));
+  }
+
+  function handleComposerDragEnter(event) {
+    if (running) {
+      return;
+    }
+    event.preventDefault();
+    composerDragDepthRef.current += 1;
+    setDragActive(true);
+  }
+
+  function handleComposerDragOver(event) {
+    if (running) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleComposerDragLeave(event) {
+    if (running) {
+      return;
+    }
+    event.preventDefault();
+    composerDragDepthRef.current = Math.max(0, composerDragDepthRef.current - 1);
+    if (composerDragDepthRef.current === 0) {
+      setDragActive(false);
+    }
+  }
+
+  function handleComposerDrop(event) {
+    if (running) {
+      return;
+    }
+    event.preventDefault();
+    composerDragDepthRef.current = 0;
+    setDragActive(false);
+    handleComposerFiles(event.dataTransfer.files);
+  }
+
+  function handleComposerPaste(event) {
+    if (running) {
+      return;
+    }
+    const files = filesFromClipboard(event.clipboardData);
+    if (!files.length) {
+      return;
+    }
+    event.preventDefault();
+    handleComposerFiles(files);
+  }
+
   async function copyWorkspaceEntry(sourcePath, targetPath) {
     const targetWorkspaceId = workspaceId;
     if (!targetWorkspaceId) {
@@ -384,12 +527,13 @@ function App() {
     return body.conversation_id;
   }
 
-  async function createRun(targetConversationId, message) {
+  async function createRun(targetConversationId, message, attachmentIds = []) {
     const response = await apiFetch(`/api/conversations/${targetConversationId}/runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         message,
+        attachment_ids: attachmentIds,
         model: settings.model,
         reasoning_effort: settings.reasoningEffort,
         speed_mode: settings.speedMode,
@@ -405,7 +549,8 @@ function App() {
   async function submitMessage(event) {
     event.preventDefault();
     const text = input.trim();
-    if (!text || running) {
+    const selectedAttachments = attachments;
+    if ((!text && selectedAttachments.length === 0) || running || attachmentUploading) {
       return;
     }
 
@@ -413,23 +558,27 @@ function App() {
     activeAssistantIdRef.current = assistantId;
     setMessages((items) => [
       ...items,
-      { id: crypto.randomUUID(), role: "user", content: text },
+      { id: crypto.randomUUID(), role: "user", content: text, attachments: selectedAttachments },
       assistantMessage(assistantId, settings),
     ]);
     setInput("");
+    setAttachments([]);
     setRunning(true);
     setUsagePanel(null);
     cancelRequestedRef.current = false;
     setStatus("排队中");
 
     try {
-      const targetConversationId = conversationId ?? (await createConversation(text));
+      const titleText = text || selectedAttachments.map((item) => item.safe_name || item.filename).join(", ") || "附件";
+      const targetConversationId = conversationId ?? (await createConversation(titleText));
       setConversationId(targetConversationId);
-      const run = await createRun(targetConversationId, text);
+      const run = await createRun(targetConversationId, text, selectedAttachments.map((item) => item.id));
+      eventSeqRef.current = 0;
       setUsagePanel(initialUsagePanel(run.run_id, run.settings ?? settings));
       connectEvents(run.run_id);
       await refreshConversations(targetConversationId);
     } catch (error) {
+      setAttachments(selectedAttachments);
       updateAssistant(assistantId, { content: displayErrorMessage(error, "运行失败"), failed: true, streaming: false });
       setRunning(false);
       setStatus("失败");
@@ -473,7 +622,11 @@ function App() {
   function connectEvents(runId) {
     sourceRef.current?.close();
     currentRunIdRef.current = runId;
-    const source = new EventSource(`${apiBaseUrl}/api/runs/${runId}/events?access_token=${encodeURIComponent(token)}`);
+    const params = new URLSearchParams({ access_token: token });
+    if (eventSeqRef.current > 0) {
+      params.set("after", String(eventSeqRef.current));
+    }
+    const source = new EventSource(`${apiBaseUrl}/api/runs/${runId}/events?${params}`);
     sourceRef.current = source;
     source.onerror = () => {
       if (cancelRequestedRef.current) {
@@ -494,6 +647,9 @@ function App() {
   }
 
   function handleRunEvent(event) {
+    if (event?.seq != null) {
+      eventSeqRef.current = Math.max(eventSeqRef.current, numeric(event.seq));
+    }
     const assistantId = activeAssistantIdRef.current;
     if (!assistantId) {
       return;
@@ -512,11 +668,14 @@ function App() {
       appendTextBlock(assistantId, event.payload?.text ?? "", event);
     } else if (event.type === "assistant.message.done") {
       completeTextBlock(assistantId, event.payload?.text ?? "", event);
+      updateAssistant(assistantId, { payload: event.payload });
+    } else if (event.type === "sandbox.exports.created") {
+      updateAssistantPayload(assistantId, { sandbox_exports: event.payload?.exports ?? [] });
     } else if (event.type === "context.estimated") {
       setUsagePanel((current) => usagePanelFromEstimate(event.payload, current));
     } else if (event.type === "model.usage") {
       setUsagePanel((current) => usagePanelFromModelUsage(event.payload, current));
-    } else if (event.type.startsWith("tool.call.") || event.type.startsWith("codex.") || event.type === "workspace.version.created" || event.type === "artifact.preview") {
+    } else if (shouldShowToolEvent(event)) {
       updateTool(assistantId, event);
     } else if (event.type === "run.completed") {
       updateAssistant(assistantId, { streaming: false });
@@ -525,6 +684,7 @@ function App() {
       setStatus("已完成");
       sourceRef.current?.close();
       loadRunUsage(event.runId ?? currentRunIdRef.current).catch((error) => pushNotice(error.message));
+      loadBillingUsage().catch((error) => pushNotice(error.message));
       refreshConversations().catch((error) => pushNotice(error.message));
     } else if (event.type === "run.failed") {
       const errorText = displayErrorMessage(event.payload?.error, "运行失败");
@@ -546,12 +706,13 @@ function App() {
   }
 
   async function selectConversation(targetConversationId) {
-    if (running || targetConversationId === conversationId) {
+    if (targetConversationId === conversationId) {
       return;
     }
     sourceRef.current?.close();
     activeAssistantIdRef.current = null;
     currentRunIdRef.current = null;
+    eventSeqRef.current = 0;
     cancelRequestedRef.current = false;
     setView("chat");
     setConversationId(targetConversationId);
@@ -565,8 +726,28 @@ function App() {
       if (!response.ok) {
         throw new Error(body.detail ?? "加载消息失败");
       }
-      setMessages((body.messages ?? []).map(storedMessage));
-      setStatus("就绪");
+      const activeRun = body.activeRun;
+      const storedMessages = (body.messages ?? []).map(storedMessage);
+      const historicalMessages = await hydrateHistoricalMessages(storedMessages, activeRun?.id);
+      if (activeRun && !isTerminalRunStatus(activeRun.status)) {
+        const assistantId = crypto.randomUUID();
+        activeAssistantIdRef.current = assistantId;
+        currentRunIdRef.current = activeRun.id;
+        setMessages([
+          ...historicalMessages,
+          assistantMessage(assistantId, eventSettings(activeRun.settings, settings)),
+        ]);
+        setUsagePanel(initialUsagePanel(activeRun.id, activeRun.settings ?? settings));
+        setRunning(true);
+        setStatus(runStatusLabel(activeRun.status));
+        await replayRunEvents(activeRun.id, assistantId);
+        connectEvents(activeRun.id);
+      } else {
+        setMessages(historicalMessages);
+        setRunning(false);
+        setUsagePanel(null);
+        setStatus("就绪");
+      }
       await refreshConversations(targetConversationId);
     } catch (error) {
       pushNotice(error.message);
@@ -575,13 +756,12 @@ function App() {
   }
 
   function startNewChat() {
-    if (running) {
-      return;
-    }
     sourceRef.current?.close();
     activeAssistantIdRef.current = null;
     currentRunIdRef.current = null;
+    eventSeqRef.current = 0;
     cancelRequestedRef.current = false;
+    setRunning(false);
     setView("chat");
     setConversationId(null);
     setMessages([]);
@@ -607,6 +787,55 @@ function App() {
       throw new Error(body.detail ?? "加载用量失败");
     }
     setUsagePanel((current) => usagePanelFromSummary(body, current));
+  }
+
+  async function replayRunEvents(runId, assistantId) {
+    const response = await apiFetch(`/api/runs/${runId}/events/history?limit=5000`);
+    const body = await response.json();
+    if (!response.ok) {
+      throw new Error(body.detail ?? "加载运行事件失败");
+    }
+    eventSeqRef.current = 0;
+    activeAssistantIdRef.current = assistantId;
+    for (const event of body.events ?? []) {
+      handleRunEvent(event);
+    }
+    eventSeqRef.current = numeric(body.lastSeq ?? eventSeqRef.current);
+  }
+
+  async function hydrateHistoricalMessages(items, activeRunId = null) {
+    const runIds = [...new Set(items.map((item) => item.runId).filter((runId) => runId && runId !== activeRunId))];
+    if (!runIds.length) {
+      return items;
+    }
+    const eventEntries = await Promise.all(runIds.map(async (runId) => {
+      try {
+        const response = await apiFetch(`/api/runs/${encodeURIComponent(runId)}/events/history?limit=5000`);
+        const body = await response.json();
+        if (!response.ok) {
+          throw new Error(body.detail ?? "加载运行事件失败");
+        }
+        return [runId, body.events ?? []];
+      } catch (error) {
+        pushNotice(error.message);
+        return [runId, []];
+      }
+    }));
+    const eventsByRun = new Map(eventEntries);
+    const assistantRunIds = new Set(items.filter((item) => item.role === "assistant" && item.runId).map((item) => item.runId));
+    const hydrated = [];
+    for (const item of items) {
+      const events = item.runId ? eventsByRun.get(item.runId) : null;
+      if (item.role === "assistant" && events?.length) {
+        hydrated.push(historicalAssistantFromRunEvents(item.runId, events, item, settings));
+      } else {
+        hydrated.push(item);
+      }
+      if (item.role === "user" && item.runId && events?.length && !assistantRunIds.has(item.runId) && runEventsHaveAssistantTimeline(events)) {
+        hydrated.push(historicalAssistantFromRunEvents(item.runId, events, null, settings));
+      }
+    }
+    return hydrated;
   }
 
   const activeTitle = view === "workspaces"
@@ -647,6 +876,7 @@ function App() {
             ? `${formatNumber(conversations.length)} 个会话`
             : status,
         usage: view === "chat" ? usagePanel : null,
+        billingUsage,
         modelCatalog,
         showWorkspaceAction: view !== "workspaces",
         onWorkspaceManage: () => setView("workspaces"),
@@ -678,18 +908,60 @@ function App() {
             onSelect: selectConversation,
           })
         : [
-          h("section", { key: "messages", className: `message-scroll${hasMessages ? "" : " empty"}`, ref: messagesRef, "aria-live": "polite" },
+          h("section", {
+            key: "messages",
+            className: `message-scroll${hasMessages ? "" : " empty"}${dragActive ? " is-dragging" : ""}`,
+            ref: messagesRef,
+            "aria-live": "polite",
+            onDragEnter: handleComposerDragEnter,
+            onDragOver: handleComposerDragOver,
+            onDragLeave: handleComposerDragLeave,
+            onDrop: handleComposerDrop,
+          },
             h("div", { className: "message-column" },
               !hasMessages
                 ? h(EmptyState, {
                   workspace: auth?.workspace,
                   onWorkspaceManage: () => setView("workspaces"),
                 })
-                : messages.map((message) => h(MessageView, { key: message.id, message }))
+                : messages.map((message) => h(MessageView, {
+                  key: message.id,
+                  message,
+                  workspaceId,
+                  apiFetch,
+                  onNotice: pushNotice,
+                }))
             )
           ),
           h("form", { key: "composer", className: `composer-wrap${hasMessages ? "" : " is-empty-chat"}`, onSubmit: submitMessage },
-            h("div", { className: "composer" },
+            h("input", {
+              ref: composerFileInputRef,
+              className: "composer-file-input",
+              type: "file",
+              multiple: true,
+              onChange: (event) => {
+                handleComposerFiles(event.target.files);
+                event.target.value = "";
+              },
+            }),
+            h("div", {
+              className: `composer${dragActive ? " is-dragging" : ""}`,
+              onDragEnter: handleComposerDragEnter,
+              onDragOver: handleComposerDragOver,
+              onDragLeave: handleComposerDragLeave,
+              onDrop: handleComposerDrop,
+            },
+              attachments.length || attachmentUploading
+                ? h("div", { className: "composer-attachments" },
+                  attachments.map((attachment) => h(AttachmentChip, {
+                    key: attachment.id,
+                    attachment,
+                    disabled: running,
+                    onRemove: () => removeAttachment(attachment.id),
+                  })),
+                  attachmentUploading ? h("span", { className: "attachment-chip is-uploading" }, "上传中") : null
+                )
+                : null,
               h("textarea", {
                 ref: inputRef,
                 value: input,
@@ -697,6 +969,7 @@ function App() {
                 placeholder: "输入消息，按 Enter 发送",
                 disabled: running,
                 onChange: (event) => setInput(event.target.value),
+                onPaste: handleComposerPaste,
                 onKeyDown: (event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
@@ -705,7 +978,13 @@ function App() {
                 },
               }),
               h("div", { className: "composer-footer" },
-                h("button", { className: "icon-button add-button", type: "button", disabled: running, title: "添加上下文" }, "+"),
+                h("button", {
+                  className: "icon-button add-button",
+                  type: "button",
+                  disabled: running || attachmentUploading,
+                  title: "上传文件",
+                  onClick: () => composerFileInputRef.current?.click(),
+                }, "+"),
                 h(RuntimeControls, {
                   model,
                   reasoningEffort,
@@ -717,7 +996,7 @@ function App() {
                 h("button", {
                   className: `send-button${running ? " stop-button" : ""}`,
                   type: running ? "button" : "submit",
-                  disabled: running ? cancelRequestedRef.current : !input.trim(),
+                  disabled: running ? cancelRequestedRef.current : ((!input.trim() && attachments.length === 0) || attachmentUploading),
                   title: running ? "停止" : "发送",
                   onClick: running ? stopRun : undefined,
                 },
@@ -743,32 +1022,18 @@ function App() {
     setMessages((items) => items.map((item) => item.id === id ? { ...item, ...patch } : item));
   }
 
+  function updateAssistantPayload(id, patch) {
+    setMessages((items) => items.map((item) => item.id === id
+      ? { ...item, payload: { ...(item.payload ?? {}), ...patch } }
+      : item));
+  }
+
   function updateTool(id, event) {
     setMessages((items) => items.map((item) => {
       if (item.id !== id) {
         return item;
       }
-      const callId = event.itemId ?? event.payload?.callId ?? `tool-${assistantBlocks(item).length}`;
-      const blocks = assistantBlocks(item);
-      const existingIndex = blocks.findIndex((block) => block.type === "tool" && block.id === callId);
-      const current = existingIndex >= 0 ? blocks[existingIndex] : {
-        id: callId,
-        type: "tool",
-        name: "工具调用",
-        status: "started",
-        detail: "",
-      };
-      const next = {
-        ...current,
-        name: event.payload?.name ?? displayEventName(event.type, current.name),
-        status: event.status ?? statusFromEventType(event.type),
-        detail: toolDetail(current.detail, event),
-      };
-      if (existingIndex >= 0) {
-        blocks[existingIndex] = next;
-      } else {
-        blocks.push(next);
-      }
+      const blocks = applyToolEventToBlocks(assistantBlocks(item), event);
       return { ...item, tools: toolBlocks(blocks), blocks };
     }));
   }
@@ -997,7 +1262,7 @@ function Sidebar({
         h(Icon, { name: "panel-left-close" })
       )
     ),
-    h("button", { className: "new-chat", type: "button", disabled: running, onClick: onNewChat },
+    h("button", { className: "new-chat", type: "button", onClick: onNewChat },
       h(Icon, { name: "circle-plus", className: "new-chat-icon" }),
       "新建会话"
     ),
@@ -1022,7 +1287,6 @@ function Sidebar({
           type: "button",
           className: "history-item",
           "aria-current": conversation.id === activeId ? "true" : "false",
-          disabled: running,
           onClick: () => onSelect(conversation.id),
         },
           h("span", { className: "history-name" }, displayConversationTitle(conversation)),
@@ -1074,7 +1338,6 @@ function ConversationHistoryPage({
           type: "button",
           className: "conversation-history-item",
           "aria-current": conversation.id === activeId ? "true" : "false",
-          disabled: running,
           onClick: () => onSelect(conversation.id),
         },
           h("span", { className: "conversation-history-name" }, displayConversationTitle(conversation)),
@@ -1255,7 +1518,7 @@ function WorkspaceManager({
       ),
       h("div", { className: "workspace-file-meta" },
         h("span", null, `位置：${targetLabel}`),
-        selectedEntry ? h("span", null, `已选：${selectedEntry.path}`) : h("span", null, "未选择文件或文件夹"),
+        selectedEntry ? h("span", null, `已选择：${selectedEntry.path}`) : h("span", null, "未选择文件或文件夹"),
         clipboard ? h("span", null, `${clipboard.mode === "cut" ? "剪切" : "复制"}：${clipboard.path}`) : null
       ),
       h("div", { className: "workspace-stats" },
@@ -1530,6 +1793,20 @@ function Icon({ name, className = "" }) {
       h("path", { d: "M14 2v6h6" })
     );
   }
+  if (name === "image") {
+    return h("svg", common,
+      h("rect", { width: "18", height: "18", x: "3", y: "3", rx: "2" }),
+      h("circle", { cx: "9", cy: "9", r: "2" }),
+      h("path", { d: "M21 15l-3.1-3.1a2 2 0 0 0-2.8 0L6 21" })
+    );
+  }
+  if (name === "download") {
+    return h("svg", common,
+      h("path", { d: "M12 3v12" }),
+      h("path", { d: "M7 10l5 5 5-5" }),
+      h("path", { d: "M5 21h14" })
+    );
+  }
   if (name === "refresh") {
     return h("svg", common,
       h("path", { d: "M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" }),
@@ -1613,6 +1890,7 @@ function Header({
   title,
   status,
   usage,
+  billingUsage,
   modelCatalog,
   showWorkspaceAction = false,
   onWorkspaceManage,
@@ -1622,7 +1900,10 @@ function Header({
   return h("header", { className: "topbar" },
     h("div", { className: "title-block" },
       h("h1", null, title),
-      usage ? h(UsageMeterStable, { usage, modelCatalog }) : null
+      usage ? h(UsageMeterStable, { usage, modelCatalog }) : null,
+      billingUsage ? h("span", { className: "billing-total-pill", title: "用户累计消费金币" },
+        `${formatCreditsFixed(billingUsage?.totals?.costCredits)} 金币`
+      ) : null
     ),
     h("div", { className: "runtime-strip" },
       showWorkspaceTreeAction ? h("button", {
@@ -1649,7 +1930,7 @@ function Header({
 }
 
 function RuntimeControls({ model, reasoningEffort, speedMode, onModel, onReasoning, onSpeed }) {
-  const normalizedModel = supportedModelValues.has(model) ? model : "gpt-5.4";
+  const normalizedModel = supportedModelValues.has(model) ? model : defaultModel;
   useEffect(() => {
     if (normalizedModel !== model) {
       onModel(normalizedModel);
@@ -1827,11 +2108,11 @@ function UsageMeterStable({ usage, modelCatalog }) {
 
 function formatCostStable(totals = {}, context = {}, modelCatalog = null) {
   if (totals.costUsd != null) {
-    return `Cost $${formatDecimal(totals.costUsd)}`;
+    return `Cost $${formatDecimal(totals.costUsd)} / ${formatCredits(totals.costCredits)} 金币`;
   }
   const estimatedCost = estimatePromptCostUsd(context, modelCatalog);
   if (estimatedCost != null) {
-    return `Est. $${formatDecimal(estimatedCost)}`;
+    return `Est. $${formatDecimal(estimatedCost)} / ${formatCredits(estimateCredits(estimatedCost, modelCatalog))} 金币`;
   }
   if (actualOrEstimateInputTokens(totals, context) > 0 || numeric(totals.outputTokens) > 0) {
     return "Cost pending";
@@ -1853,39 +2134,126 @@ function estimatePromptCostUsd(context = {}, modelCatalog = null) {
   return inputTokens * numeric(rates.input);
 }
 
-function EmptyState({ workspace, onWorkspaceManage }) {
+function estimateCredits(usd, modelCatalog = null) {
+  const rate = numeric(modelCatalog?.pricing?.usdToCreditsRate ?? 7);
+  return numeric(usd) * rate;
+}
+
+function EmptyState() {
   return h("div", { className: "empty-state" },
-    h(EmptyBlinkingSquare),
-    h("button", {
-      className: "empty-workspace-button",
-      type: "button",
-      onClick: onWorkspaceManage,
-    },
-      h(Icon, { name: "folder" }),
-      h("span", null, "工作空间"),
-      h("small", null, "文件和文件夹")
+    h(EmptyMascot)
+  );
+}
+
+function EmptyMascot() {
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    const node = rootRef.current;
+    const supportsFinePointer = window.matchMedia?.("(pointer: fine)").matches ?? true;
+    if (!node || !supportsFinePointer) {
+      return undefined;
+    }
+
+    let frameId = 0;
+    let pointer = null;
+
+    function setGaze(prefix, x, y) {
+      node.style.setProperty(`--${prefix}-gaze-x`, `${x}px`);
+      node.style.setProperty(`--${prefix}-gaze-y`, `${y}px`);
+    }
+
+    function gazeFor(target) {
+      const rect = target.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const dx = pointer.x - centerX;
+      const dy = pointer.y - centerY;
+      const distance = Math.hypot(dx, dy);
+      const maxOffset = 7;
+      const offset = Math.min(maxOffset, distance / 22);
+      return {
+        x: distance ? (dx / distance) * offset : 0,
+        y: distance ? (dy / distance) * offset : 0,
+      };
+    }
+
+    function updateGaze() {
+      frameId = 0;
+      if (!pointer) {
+        return;
+      }
+      const face = node.querySelector(".empty-mascot-face") ?? node;
+      const side = node.querySelector(".empty-mascot-side") ?? node;
+      const faceGaze = gazeFor(face);
+      const sideGaze = gazeFor(side);
+      setGaze("face", faceGaze.x, faceGaze.y);
+      setGaze("side", sideGaze.x, sideGaze.y);
+    }
+
+    function handlePointerMove(event) {
+      pointer = { x: event.clientX, y: event.clientY };
+      if (!frameId) {
+        frameId = window.requestAnimationFrame(updateGaze);
+      }
+    }
+
+    function resetGaze() {
+      pointer = null;
+      if (frameId) {
+        window.cancelAnimationFrame(frameId);
+        frameId = 0;
+      }
+      setGaze("face", 0, 0);
+      setGaze("side", 0, 0);
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("blur", resetGaze);
+    document.addEventListener("mouseleave", resetGaze);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("blur", resetGaze);
+      document.removeEventListener("mouseleave", resetGaze);
+      if (frameId) {
+        window.cancelAnimationFrame(frameId);
+      }
+    };
+  }, []);
+
+  return h("div", { className: "empty-mascot", ref: rootRef, role: "img", "aria-label": "等待输入" },
+    h("div", { className: "empty-mascot-face" },
+      h(MascotEye, { className: "face left" }),
+      h(MascotEye, { className: "face right" })
+    ),
+    h("div", { className: "empty-mascot-side" },
+      h(MascotEye, { className: "side left" }),
+      h(MascotEye, { className: "side right" })
     )
   );
 }
 
-function EmptyBlinkingSquare() {
-  return h("div", { className: "empty-blinking-square", role: "status", "aria-label": "等待输入" },
-    h("dotlottie-wc", {
-      className: "empty-blinking-lottie",
-      src: "/assets/Blinking%20Square.lottie",
-      autoplay: true,
-      loop: true,
-    })
+function MascotEye({ className }) {
+  return h("span", { className: `empty-mascot-eye ${className}` },
+    h("span", { className: "empty-mascot-pupil" })
   );
 }
 
-function MessageView({ message }) {
+function MessageView({ message, workspaceId, apiFetch, onNotice }) {
   if (message.role === "notice") {
     return h("article", { className: "notice-message" }, message.content);
   }
   if (message.role === "user") {
     return h("article", { className: "user-row" },
-      h("div", { className: "user-bubble" }, message.content)
+      h("div", { className: "user-bubble" },
+        message.content ? h("div", null, message.content) : null,
+        message.attachments?.length ? h("div", { className: "user-attachments" },
+          message.attachments.map((attachment) => h("span", { key: attachment.id, className: "user-attachment" },
+            h(Icon, { name: attachment.model_kind === "image" ? "image" : "file" }),
+            h("span", null, attachment.safe_name || attachment.filename || attachment.original_name || "file")
+          ))
+        ) : null
+      )
     );
   }
   return h("article", { className: `assistant-row${message.failed ? " failed" : ""}${message.streaming ? " streaming" : ""}` },
@@ -1895,7 +2263,16 @@ function MessageView({ message }) {
     h("div", { className: "assistant-body" },
       h("div", { className: "assistant-blocks" },
         assistantBlocks(message).length
-          ? assistantBlocks(message).map((block) => h(AssistantBlock, { key: block.id, block, streaming: message.streaming }))
+          ? assistantBlocks(message).map((block, index, blocks) => h(AssistantBlock, {
+            key: block.id,
+            block,
+            showExports: index === blocks.findLastIndex((item) => item.type === "text"),
+            streaming: message.streaming,
+            message,
+            workspaceId,
+            apiFetch,
+            onNotice,
+          }))
           : (message.failed ? "" : h("span", { className: "assistant-placeholder" })),
         message.cancelled ? h("div", { className: "assistant-stop-note" }, "已停止") : null
       )
@@ -1903,19 +2280,21 @@ function MessageView({ message }) {
   );
 }
 
-function AssistantBlock({ block, streaming = false }) {
+function AssistantBlock({ block, showExports = false, streaming = false, message, workspaceId, apiFetch, onNotice }) {
   if (block.type === "reasoning") {
     return h(ReasoningDisclosure, { block });
   }
   if (block.type === "tool") {
     return h(ToolDisclosure, { block });
   }
-  return h(AssistantTextBlock, { block, streaming });
+  return h(AssistantTextBlock, { block, showExports, streaming, message, workspaceId, apiFetch, onNotice });
 }
 
-function AssistantTextBlock({ block, streaming = false }) {
+function AssistantTextBlock({ block, showExports = false, streaming = false, message, workspaceId, apiFetch, onNotice }) {
+  const exports = showExports ? (message?.payload?.sandbox_exports ?? []) : [];
   return h("div", { className: "assistant-text assistant-text-block" },
-    block.text ? h(MarkdownView, { content: block.text, streaming: streaming && block.status !== "completed" }) : null
+    block.text ? h(MarkdownView, { content: stripSandboxLinks(block.text), streaming: streaming && block.status !== "completed" }) : null,
+    exports.length ? h(SandboxExportList, { exports, workspaceId, apiFetch, onNotice }) : null
   );
 }
 
@@ -1958,6 +2337,64 @@ function MarkdownView({ content, streaming = false }) {
   return h(MarkdownRenderer, { content, streaming });
 }
 
+function AttachmentChip({ attachment, disabled, onRemove }) {
+  const name = attachment.safe_name || attachment.filename || attachment.original_name || "file";
+  return h("span", { className: "attachment-chip", title: name },
+    h(Icon, { name: attachment.model_kind === "image" ? "image" : "file" }),
+    h("span", { className: "attachment-chip-name" }, name),
+    h("span", { className: "attachment-chip-size" }, formatBytes(attachment.size)),
+    h("button", { type: "button", disabled, onClick: onRemove, title: "移除" },
+      h(Icon, { name: "x" })
+    )
+  );
+}
+
+function SandboxExportList({ exports: exportedFiles, workspaceId, apiFetch, onNotice }) {
+  return h("div", { className: "sandbox-export-list" },
+    exportedFiles.map((item, index) => h("div", {
+      key: `${item.sandbox_path}-${index}`,
+      className: `sandbox-export-card${item.ok ? "" : " is-failed"}`,
+    },
+      h("div", { className: "sandbox-export-main" },
+        h(Icon, { name: item.ok ? "download" : "file" }),
+        h("div", null,
+          h("strong", null, item.description || baseName(item.workspace_path || item.sandbox_path) || "导出文件"),
+          h("span", null, item.ok ? `${baseName(item.workspace_path)} · ${formatBytes(item.size)}` : item.error)
+        )
+      ),
+      item.ok ? h("button", {
+        type: "button",
+        className: "sandbox-download-button",
+        onClick: () => downloadWorkspaceFile({ workspaceId, path: item.workspace_path, apiFetch, onNotice }),
+      }, "下载") : null
+    ))
+  );
+}
+
+async function downloadWorkspaceFile({ workspaceId, path, apiFetch, onNotice }) {
+  try {
+    if (!workspaceId || !path) {
+      throw new Error("文件不可下载");
+    }
+    const response = await apiFetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/file-bytes/${encodeWorkspacePath(path)}`);
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail ?? "下载失败");
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = baseName(path) || "download";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    onNotice?.(error.message);
+  }
+}
+
 function ThinkingIndicator({ className = "" } = {}) {
   return h("div", { className: `thinking-indicator ${className}`.trim(), role: "status", "aria-label": "正在思考" },
     h("dotlottie-wc", {
@@ -1989,7 +2426,9 @@ function storedMessage(message) {
     return {
       id: message.id ?? crypto.randomUUID(),
       role: "assistant",
+      runId: message.run_id ?? message.runId ?? null,
       content: message.content,
+      payload: message.payload,
       reasoning: "",
       tools: [],
       blocks: message.content ? [{
@@ -2006,7 +2445,68 @@ function storedMessage(message) {
   return {
     id: message.id ?? crypto.randomUUID(),
     role: "user",
+    runId: message.run_id ?? message.runId ?? null,
     content: message.content,
+    attachments: message.attachments ?? [],
+    payload: message.payload,
+  };
+}
+
+function runEventsHaveAssistantTimeline(events) {
+  return events.some((event) => (
+    event.type?.startsWith("assistant.") ||
+    shouldShowToolEvent(event) ||
+    event.type === "sandbox.exports.created" ||
+    event.type === "run.failed" ||
+    event.type === "run.cancelled"
+  ));
+}
+
+function historicalAssistantFromRunEvents(runId, events, baseMessage = null, fallbackSettings = {}) {
+  let blocks = [];
+  let payload = { ...(baseMessage?.payload ?? {}) };
+  let failed = Boolean(baseMessage?.failed);
+  let cancelled = Boolean(baseMessage?.cancelled);
+  let settings = fallbackSettings;
+  for (const event of events) {
+    if (event.type === "run.started") {
+      settings = eventSettings(event.payload, fallbackSettings);
+    } else if (event.type === "assistant.reasoning_summary.delta") {
+      blocks = applyReasoningDeltaToBlocks(blocks, event);
+    } else if (event.type === "assistant.reasoning_summary.done") {
+      blocks = applyReasoningDoneToBlocks(blocks, event);
+    } else if (event.type === "assistant.message.delta") {
+      blocks = applyTextDeltaToBlocks(blocks, event.payload?.text ?? "", event);
+    } else if (event.type === "assistant.message.done") {
+      blocks = applyTextDoneToBlocks(blocks, event.payload?.text ?? baseMessage?.content ?? "", event);
+      payload = { ...payload, ...(event.payload ?? {}) };
+    } else if (event.type === "sandbox.exports.created") {
+      payload = { ...payload, sandbox_exports: event.payload?.exports ?? [] };
+    } else if (shouldShowToolEvent(event)) {
+      blocks = applyToolEventToBlocks(blocks, event);
+    } else if (event.type === "run.failed") {
+      failed = true;
+      blocks = applyTextDoneToBlocks(blocks, displayErrorMessage(event.payload?.error, "运行失败"), event);
+    } else if (event.type === "run.cancelled") {
+      cancelled = true;
+    }
+  }
+  if (baseMessage?.content && !textContent(blocks).trim()) {
+    blocks = applyTextDoneToBlocks(blocks, baseMessage.content, { itemId: baseMessage.id, status: "completed" });
+  }
+  return {
+    id: baseMessage?.id ?? `${runId}-assistant-history`,
+    role: "assistant",
+    runId,
+    content: textContent(blocks),
+    payload,
+    reasoning: reasoningText(blocks),
+    tools: toolBlocks(blocks),
+    blocks,
+    settings,
+    failed,
+    cancelled,
+    streaming: false,
   };
 }
 
@@ -2086,6 +2586,8 @@ function usagePanelFromModelUsage(payload = {}, current = null) {
       totalTokens: numeric(usage.totalTokens),
       costMicroUsd: payload.costMicroUsd,
       costUsd: payload.costMicroUsd == null ? null : payload.costMicroUsd / 1000000,
+      costMicroCredits: payload.costMicroCredits,
+      costCredits: payload.costMicroCredits == null ? null : payload.costMicroCredits / 1000000,
       pricingConfigured: payload.costMicroUsd != null,
     },
     usageEvents: [...(current?.usageEvents ?? []), payload],
@@ -2094,6 +2596,24 @@ function usagePanelFromModelUsage(payload = {}, current = null) {
 
 function hasProviderUsage(panel) {
   return Array.isArray(panel?.usageEvents) && panel.usageEvents.some((event) => event?.source === "provider-usage");
+}
+
+function isTerminalRunStatus(status) {
+  return ["completed", "failed", "cancelled"].includes(String(status ?? ""));
+}
+
+function runStatusLabel(status) {
+  const value = String(status ?? "");
+  if (value === "queued") {
+    return "排队中";
+  }
+  if (value === "starting") {
+    return "启动中";
+  }
+  if (value === "running") {
+    return "运行中";
+  }
+  return "运行中";
 }
 
 function contextFromUsagePayload(payload = {}, current = null) {
@@ -2212,12 +2732,30 @@ function formatCost(totals = {}) {
 
 function formatCostLegacy(totals = {}) {
   if (totals.costCredits != null) {
-    return `额度 ${formatDecimal(totals.costCredits)} credits`;
+    return `${formatCredits(totals.costCredits)} 金币`;
   }
   if (totals.costUsd != null) {
-    return `费用 $${formatDecimal(totals.costUsd)}`;
+    return `Cost $${formatDecimal(totals.costUsd)}`;
   }
   return "Cost pending";
+}
+
+function formatCredits(value) {
+  const number = numeric(value);
+  if (number === 0) {
+    return "0";
+  }
+  if (number < 0.000001) {
+    return "<0.000001";
+  }
+  if (number < 0.01) {
+    return number.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+  }
+  return formatDecimal(number);
+}
+
+function formatCreditsFixed(value) {
+  return numeric(value).toFixed(2);
 }
 
 function formatNumber(value) {
@@ -2394,6 +2932,66 @@ function encodeWorkspacePath(path) {
     .join("/");
 }
 
+function filesFromClipboard(clipboardData) {
+  const items = Array.from(clipboardData?.items ?? []);
+  const files = [];
+  for (const item of items) {
+    if (item.kind !== "file") {
+      continue;
+    }
+    const file = item.getAsFile();
+    if (!file) {
+      continue;
+    }
+    if (file.type.startsWith("image/")) {
+      const extension = extensionForContentType(file.type);
+      files.push(new File([file], `screenshot-${timestampForFilename()}.${extension}`, { type: file.type }));
+    } else {
+      files.push(file);
+    }
+  }
+  return files;
+}
+
+function isEditableTarget(target) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tagName = target.tagName.toLowerCase();
+  return target.isContentEditable || tagName === "textarea" || tagName === "input" || tagName === "select";
+}
+
+function extensionForContentType(contentType) {
+  if (contentType === "image/jpeg") {
+    return "jpg";
+  }
+  if (contentType === "image/webp") {
+    return "webp";
+  }
+  if (contentType === "image/gif") {
+    return "gif";
+  }
+  return "png";
+}
+
+function timestampForFilename() {
+  const date = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
+}
+
+function stripSandboxLinks(text) {
+  return String(text ?? "").replace(/!\[[^\]]*\]\(sandbox:\/\/[^)]+\)/g, "").trim();
+}
+
 async function copyText(text) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -2487,20 +3085,135 @@ function toolBlocks(blocks) {
   return blocks.filter((block) => block.type === "tool");
 }
 
+function shouldShowToolEvent(event) {
+  if (event?.visibility === "debug" || event?.visibility === "hidden") {
+    return false;
+  }
+  return event?.type?.startsWith("tool.call.") ||
+    event?.type?.startsWith("codex.") ||
+    event?.type === "workspace.version.created";
+}
+
+function applyReasoningDeltaToBlocks(blocks, event) {
+  const text = event.payload?.text ?? "";
+  if (!text) {
+    return blocks;
+  }
+  const blockId = reasoningBlockId(event, blocks);
+  return upsertBlock(blocks, blockId, () => ({
+    id: blockId,
+    type: "reasoning",
+    text: "",
+    status: event.status ?? "running",
+  }), (block) => ({
+    ...block,
+    text: `${block.text ?? ""}${text}`,
+    status: event.status ?? block.status ?? "running",
+  }));
+}
+
+function applyReasoningDoneToBlocks(blocks, event) {
+  const text = event.payload?.text ?? "";
+  if (!String(text).trim()) {
+    return blocks;
+  }
+  const blockId = reasoningBlockId(event, blocks);
+  return upsertBlock(blocks, blockId, () => ({
+    id: blockId,
+    type: "reasoning",
+    text,
+    status: event.status ?? "completed",
+  }), (block) => ({
+    ...block,
+    text: text && !String(block.text ?? "").trim() ? text : block.text,
+    status: event.status ?? "completed",
+  }));
+}
+
+function applyTextDeltaToBlocks(blocks, text, event, options = {}) {
+  if (!text) {
+    return blocks;
+  }
+  const last = blocks[blocks.length - 1];
+  if (!options.forceNew && last?.type === "text") {
+    const next = [...blocks];
+    next[next.length - 1] = {
+      ...last,
+      text: `${last.text ?? ""}${text}`,
+      status: options.status ?? event.status ?? last.status ?? "running",
+    };
+    return next;
+  }
+  return [
+    ...blocks,
+    {
+      id: event.itemId ? `${event.itemId}-text-${blocks.length}` : `text-${blocks.length}`,
+      type: "text",
+      text,
+      status: options.status ?? event.status ?? "running",
+    },
+  ];
+}
+
+function applyTextDoneToBlocks(blocks, text, event) {
+  const existingText = textContent(blocks);
+  if (text && !existingText.trim()) {
+    return [
+      ...blocks,
+      {
+        id: event.itemId ? `${event.itemId}-text-${blocks.length}` : `text-${blocks.length}`,
+        type: "text",
+        text,
+        status: event.status ?? "completed",
+      },
+    ];
+  }
+  if (blocks.length && blocks[blocks.length - 1]?.type === "text") {
+    const next = [...blocks];
+    next[next.length - 1] = { ...next[next.length - 1], status: event.status ?? "completed" };
+    return next;
+  }
+  return blocks;
+}
+
+function applyToolEventToBlocks(blocks, event) {
+  const callId = event.itemId ?? event.payload?.callId ?? `tool-${blocks.length}`;
+  const nextBlocks = [...blocks];
+  const existingIndex = nextBlocks.findIndex((block) => block.type === "tool" && block.id === callId);
+  const current = existingIndex >= 0 ? nextBlocks[existingIndex] : {
+    id: callId,
+    type: "tool",
+    name: "工具调用",
+    status: "started",
+    detail: "",
+  };
+  const next = {
+    ...current,
+    name: event.payload?.displayName ?? event.payload?.name ?? displayEventName(event.type, current.name),
+    status: toolEventStatus(event),
+    detail: toolDetail(current.detail, event),
+  };
+  if (existingIndex >= 0) {
+    nextBlocks[existingIndex] = next;
+  } else {
+    nextBlocks.push(next);
+  }
+  return nextBlocks;
+}
+
 function displayEventName(type, fallback) {
   const labels = {
-    "codex.command.started": "shell",
-    "codex.command.completed": "shell",
+    "codex.command.started": "bash (/sandbox)",
+    "codex.command.completed": "bash (/sandbox)",
     "codex.patch.started": "apply_patch",
     "codex.patch.completed": "apply_patch",
     "workspace.version.created": "workspace_export",
-    "artifact.preview": "viewTool2",
   };
   return labels[type] ?? fallback ?? "工具调用";
 }
 
 function statusFromEventType(type) {
-  if (type.endsWith(".completed") || type === "workspace.version.created" || type === "artifact.preview") {
+  if (type.endsWith(".completed") || type === "workspace.version.created") {
     return "completed";
   }
   if (type.endsWith(".failed")) {
@@ -2510,6 +3223,21 @@ function statusFromEventType(type) {
     return "running";
   }
   return type.replace("tool.call.", "");
+}
+
+function toolEventStatus(event) {
+  if (event.type !== "codex.command.completed") {
+    return event.status ?? statusFromEventType(event.type);
+  }
+  const summary = shellSummaryFromPayload(event.payload ?? {});
+  if (
+    event.payload?.ok === false ||
+    summary.timedOut ||
+    (summary.exitCode != null && summary.exitCode !== 0)
+  ) {
+    return "failed";
+  }
+  return event.status ?? statusFromEventType(event.type);
 }
 
 function toolStatusLabel(status) {
@@ -2557,13 +3285,7 @@ function toolDetail(previous, event) {
     });
   }
   if (event.type === "codex.command.completed") {
-    return formatPayload({
-      exitCode: event.payload?.exitCode,
-      timedOut: event.payload?.timedOut,
-      durationMs: event.payload?.durationMs,
-      stdout: event.payload?.stdout,
-      stderr: event.payload?.stderr,
-    });
+    return formatPayload(shellSummaryFromPayload(event.payload ?? {}));
   }
   if (event.type === "codex.patch.started") {
     return formatPayload(event.payload?.operation ?? event.payload ?? {});
@@ -2580,10 +3302,57 @@ function toolDetail(previous, event) {
       exported: event.payload?.exported,
     });
   }
-  if (event.type === "artifact.preview") {
-    return formatPayload(event.payload?.preview ?? event.payload ?? {});
-  }
   return formatPayload(event.payload ?? {});
+}
+
+function shellSummaryFromPayload(payload) {
+  const summary = normalizeShellOutput(payload.output);
+  return {
+    exitCode: payload.exitCode ?? summary.exitCode,
+    timedOut: payload.timedOut ?? summary.timedOut,
+    durationMs: payload.durationMs ?? summary.durationMs,
+    stdout: payload.stdout || summary.stdout,
+    stderr: payload.stderr || summary.stderr,
+  };
+}
+
+function normalizeShellOutput(output) {
+  const parsed = parseJsonMaybe(output);
+  if (Array.isArray(parsed)) {
+    return shellSummaryFromRows(parsed, null);
+  }
+  if (Array.isArray(parsed?.output)) {
+    return shellSummaryFromRows(parsed.output, parsed.ok === false ? parsed.error ?? "Tool execution failed" : null);
+  }
+  if (parsed?.output) {
+    return normalizeShellOutput(parsed.output);
+  }
+  if (parsed && typeof parsed === "object") {
+    if ("stdout" in parsed || "stderr" in parsed || "outcome" in parsed) {
+      return shellSummaryFromRows([parsed], null);
+    }
+    if (parsed.ok === false || parsed.error) {
+      return shellSummaryFromRows([], parsed.error ?? "Tool execution failed");
+    }
+  }
+  if (typeof parsed === "string" && parsed.trim()) {
+    return shellSummaryFromRows([], parsed);
+  }
+  return shellSummaryFromRows([], null);
+}
+
+function shellSummaryFromRows(rows, error) {
+  const last = rows.at(-1) ?? {};
+  return {
+    exitCode: last.outcome?.type === "exit" ? last.outcome.exitCode : null,
+    timedOut: rows.some((row) => row?.outcome?.type === "timeout"),
+    durationMs: numeric(last.duration_ms),
+    stdout: rows.map((row) => row?.stdout ?? "").filter(Boolean).join("\n"),
+    stderr: [
+      rows.map((row) => row?.stderr ?? "").filter(Boolean).join("\n"),
+      error,
+    ].filter(Boolean).join("\n"),
+  };
 }
 
 function formatPayload(value) {
@@ -2591,6 +3360,20 @@ function formatPayload(value) {
     return value;
   }
   return JSON.stringify(value ?? {}, null, 2);
+}
+
+function parseJsonMaybe(value) {
+  if (value === undefined || value === null || value === "") {
+    return {};
+  }
+  if (typeof value !== "string") {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
 }
 
 function userInitial(user) {
@@ -2626,4 +3409,6 @@ function resolveApiBaseUrl() {
   return localStorage.getItem(apiBaseUrlStorageKey) || "http://127.0.0.1:8000";
 }
 
-createRoot(document.querySelector("#root")).render(h(App));
+const rootElement = document.querySelector("#root");
+window.__webcodexRoot = window.__webcodexRoot ?? createRoot(rootElement);
+window.__webcodexRoot.render(h(App));

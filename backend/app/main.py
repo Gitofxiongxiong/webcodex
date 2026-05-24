@@ -14,11 +14,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from functools import lru_cache
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import httpx
@@ -49,7 +50,7 @@ ReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 SpeedMode = Literal["standard", "fast"]
 
 MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,80}$")
-SUPPORTED_MODELS = {"gpt-5.4", "gpt-5.5"}
+SUPPORTED_MODELS = {"gpt-5.5"}
 ACCOUNT_PATTERN = re.compile(r"^[A-Za-z0-9._@+-]{3,64}$")
 SERVICE_TIER_BY_SPEED_MODE = {
     "standard": "default",
@@ -57,14 +58,48 @@ SERVICE_TIER_BY_SPEED_MODE = {
 }
 DEFAULT_CONTEXT_WINDOW = 128000
 DEFAULT_RESERVED_OUTPUT_TOKENS = 8192
+DEFAULT_USD_PRICES_PER_1M = {
+    "gpt-5.5": {
+        "input": 5.0,
+        "cached": 0.5,
+        "output": 30.0,
+        "priority_input": 12.5,
+        "priority_cached": 1.25,
+        "priority_output": 75.0,
+    },
+}
 OPENROUTER_PROVIDER_PREFIX = "openai/"
 _openrouter_price_cache: tuple[float, dict[str, dict[str, float]]] | None = None
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 MAX_ATTACHMENTS_PER_MESSAGE = 20
 IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+SANDBOX_EXPORT_PATTERN = re.compile(r"!\[([^\]]*)\]\(sandbox://([^)#?]+)(?:[?#][^)]*)?\)")
+MAX_SANDBOX_EXPORTS_PER_MESSAGE = 20
+MAX_SANDBOX_EXPORT_BYTES = 100 * 1024 * 1024
 run_processes: dict[str, subprocess.Popen] = {}
 run_processes_lock = threading.RLock()
+run_scheduler_task: asyncio.Task | None = None
+
+
+@app.on_event("startup")
+async def start_run_scheduler() -> None:
+    global run_scheduler_task
+    store.requeue_starting_runs()
+    if not run_scheduler_task or run_scheduler_task.done():
+        run_scheduler_task = asyncio.create_task(run_scheduler_loop())
+
+
+@app.on_event("shutdown")
+async def stop_run_scheduler() -> None:
+    global run_scheduler_task
+    if run_scheduler_task and not run_scheduler_task.done():
+        run_scheduler_task.cancel()
+        try:
+            await run_scheduler_task
+        except asyncio.CancelledError:
+            pass
+    run_scheduler_task = None
 
 
 @lru_cache
@@ -183,6 +218,21 @@ def issue_session(user_id: str) -> str:
     return token
 
 
+def issue_agent_secret() -> str:
+    return f"wcx_{secrets.token_urlsafe(32)}"
+
+
+def public_agent_credential(credential: dict) -> dict:
+    return {
+        "id": credential["id"],
+        "name": credential.get("name"),
+        "keyPrefix": credential.get("key_prefix"),
+        "status": credential.get("status"),
+        "createdAt": credential.get("created_at"),
+        "lastUsedAt": credential.get("last_used_at"),
+    }
+
+
 def public_user(user: dict) -> dict:
     return {
         "id": user["id"],
@@ -193,17 +243,27 @@ def public_user(user: dict) -> dict:
 
 
 def model_catalog_payload(app_settings: Settings) -> dict:
+    usd_prices = effective_usd_price_catalog(app_settings)
     return {
         "models": sorted(SUPPORTED_MODELS),
         "contextWindow": DEFAULT_CONTEXT_WINDOW,
         "reservedOutputTokens": DEFAULT_RESERVED_OUTPUT_TOKENS,
         "pricing": {
-            "source": "openrouter",
-            "basis": "per_token",
-            "usdPrices": openrouter_price_catalog(app_settings),
+            "source": "openai-defaults",
+            "basis": "per_1m_tokens",
+            "usdPrices": usd_prices,
             "overrideUsdPricesPer1M": configured_usd_price_catalog(app_settings),
+            "openrouterUsdPrices": openrouter_price_catalog(app_settings),
+            "usdToCreditsRate": app_settings.billing_usd_to_credits_rate,
             "url": app_settings.openrouter_models_url,
         },
+    }
+
+
+def effective_usd_price_catalog(app_settings: Settings) -> dict[str, dict[str, float]]:
+    return {
+        **supported_price_catalog(DEFAULT_USD_PRICES_PER_1M),
+        **configured_usd_price_catalog(app_settings),
     }
 
 
@@ -275,7 +335,7 @@ def normalize_price_catalog(raw: dict) -> dict[str, dict[str, float]]:
         if not isinstance(model_name, str) or not isinstance(rates, dict):
             continue
         normalized_rates = {}
-        for key in ("input", "cached", "output"):
+        for key in ("input", "cached", "output", "priority_input", "priority_cached", "priority_output"):
             number = numeric_or_none(rates.get(key))
             if number is not None:
                 normalized_rates[key] = number
@@ -287,6 +347,7 @@ def normalize_price_catalog(raw: dict) -> dict[str, dict[str, float]]:
 def enrich_usage_payload(payload: dict, app_settings: Settings) -> dict:
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     model = str(payload.get("model") or "").strip()
+    service_tier = str(payload.get("serviceTier") or payload.get("service_tier") or "").strip()
     input_tokens = numeric_or_zero(usage.get("inputTokens") or usage.get("input_tokens"))
     cached_tokens = numeric_or_zero(usage.get("cachedTokens") or usage.get("cached_tokens"))
     output_tokens = numeric_or_zero(usage.get("outputTokens") or usage.get("output_tokens"))
@@ -297,24 +358,36 @@ def enrich_usage_payload(payload: dict, app_settings: Settings) -> dict:
     price_source = "MODEL_PRICES_USD_PER_1M_JSON"
     price_basis = "per_1m_tokens"
     if not usd_pricing:
+        usd_pricing = price_for_model(DEFAULT_USD_PRICES_PER_1M, model)
+        price_source = "openai-defaults"
+    if not usd_pricing:
         usd_pricing = price_for_model(openrouter_price_catalog(app_settings), model)
         price_source = "openrouter"
         price_basis = "per_token"
     if usd_pricing:
-        enriched["costMicroUsd"] = calculate_micro_cost(
+        effective_rates = rates_for_service_tier(usd_pricing, service_tier)
+        cost_micro_usd = calculate_micro_cost(
             billable_input_tokens=billable_input_tokens,
             cached_tokens=cached_tokens,
             output_tokens=output_tokens,
-            rates=usd_pricing,
+            rates=effective_rates,
             basis=price_basis,
+        )
+        enriched["costMicroUsd"] = cost_micro_usd
+        enriched["costMicroCredits"] = calculate_micro_credits(
+            cost_micro_usd=cost_micro_usd,
+            usd_to_credits_rate=app_settings.billing_usd_to_credits_rate,
         )
         enriched["pricing"] = {
             **(enriched.get("pricing") if isinstance(enriched.get("pricing"), dict) else {}),
             "unit": "usd",
             "basis": price_basis,
-            "rates": usd_pricing,
+            "rates": effective_rates,
+            "baseRates": usd_pricing,
             "source": price_source,
+            "serviceTier": service_tier or None,
             "billableInputTokens": billable_input_tokens,
+            "usdToCreditsRate": app_settings.billing_usd_to_credits_rate,
         }
     return enriched
 
@@ -363,6 +436,21 @@ def normalize_model_key(model: str) -> str:
     return model.strip().lower()
 
 
+def rates_for_service_tier(rates: dict[str, float], service_tier: str) -> dict[str, float]:
+    normalized_tier = service_tier.strip().lower()
+    if normalized_tier != "priority":
+        return {
+            "input": rates.get("input", 0.0),
+            "cached": rates.get("cached", rates.get("input", 0.0)),
+            "output": rates.get("output", 0.0),
+        }
+    return {
+        "input": rates.get("priority_input", rates.get("input", 0.0)),
+        "cached": rates.get("priority_cached", rates.get("cached", rates.get("input", 0.0))),
+        "output": rates.get("priority_output", rates.get("output", 0.0)),
+    }
+
+
 def calculate_micro_cost(
     *,
     billable_input_tokens: int,
@@ -377,6 +465,11 @@ def calculate_micro_cost(
     if basis == "per_token":
         return int(round((input_cost + cached_cost + output_cost) * 1_000_000))
     return int(round(input_cost + cached_cost + output_cost))
+
+
+def calculate_micro_credits(*, cost_micro_usd: int, usd_to_credits_rate: float) -> int:
+    rate = max(numeric_or_zero_float(usd_to_credits_rate), 0.0)
+    return int(round(cost_micro_usd * rate))
 
 
 def numeric_or_none(value) -> float | None:
@@ -407,6 +500,10 @@ def ensure_user_workspace(user: dict) -> dict:
         workspace_id=default_workspace_id(user["id"]),
         name="Default Workspace",
     )
+
+
+def ensure_user_agent_credential(user: dict) -> dict:
+    return store.ensure_agent_credential(user["id"])
 
 
 def require_workspace_owner(workspace_id: str, user: dict) -> dict:
@@ -645,17 +742,31 @@ def register(body: RegisterRequest) -> dict:
     display_name = (body.name or account).strip() or account
     if store.get_user_by_account(account):
         raise HTTPException(status_code=400, detail="Account already exists")
+    agent_secret = issue_agent_secret()
     try:
         user = store.create_user_account(
             account=account,
             name=display_name,
             password_hash=password_hash(body.password),
         )
+        agent_credential = store.create_agent_credential(
+            user_id=user["id"],
+            key_hash=token_hash(agent_secret),
+            key_prefix=agent_secret[:12],
+        )
         workspace = ensure_user_workspace(user)
         token = issue_session(user["id"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"token": token, "user": public_user(user), "workspace": workspace}
+    return {
+        "token": token,
+        "user": public_user(user),
+        "workspace": workspace,
+        "agentCredential": {
+            **public_agent_credential(agent_credential),
+            "secret": agent_secret,
+        },
+    }
 
 
 @app.post("/api/auth/login")
@@ -666,22 +777,59 @@ def login(body: AuthRequest) -> dict:
         raise HTTPException(status_code=401, detail="Invalid account or password")
     try:
         workspace = ensure_user_workspace(user)
+        agent_credential = ensure_user_agent_credential(user)
         token = issue_session(user["id"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"token": token, "user": public_user(user), "workspace": workspace}
+    return {
+        "token": token,
+        "user": public_user(user),
+        "workspace": workspace,
+        "agentCredential": public_agent_credential(agent_credential),
+    }
 
 
 @app.get("/api/auth/me")
 def auth_me(current_user: dict = Depends(get_current_user)) -> dict:
     workspace = ensure_user_workspace(current_user)
-    return {"user": public_user(current_user), "workspace": workspace}
+    agent_credential = ensure_user_agent_credential(current_user)
+    return {
+        "user": public_user(current_user),
+        "workspace": workspace,
+        "agentCredential": public_agent_credential(agent_credential),
+    }
 
 
 @app.get("/api/models/catalog")
 def get_model_catalog(current_user: dict = Depends(get_current_user)) -> dict:
     _ = current_user
     return model_catalog_payload(settings)
+
+
+@app.get("/api/agent-credentials")
+def list_agent_credentials(current_user: dict = Depends(get_current_user)) -> dict:
+    ensure_user_agent_credential(current_user)
+    return {
+        "credentials": [
+            public_agent_credential(credential)
+            for credential in store.list_agent_credentials(current_user["id"])
+        ]
+    }
+
+
+@app.get("/api/billing/usage")
+def get_billing_usage(
+    agent_credential_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    if agent_credential_id:
+        credentials = store.list_agent_credentials(current_user["id"])
+        if agent_credential_id not in {credential["id"] for credential in credentials}:
+            raise HTTPException(status_code=404, detail="Agent credential not found")
+    return store.get_user_usage_summary(
+        user_id=current_user["id"],
+        agent_credential_id=agent_credential_id,
+    )
 
 
 @app.post("/api/auth/logout")
@@ -705,7 +853,7 @@ def get_user(user_id: str) -> dict:
 
 @app.post("/api/workspaces")
 def create_workspace(body: CreateWorkspaceRequest, current_user: dict = Depends(get_current_user)) -> dict:
-    workspace_id = body.id or f"workspace_{uuid.uuid4().hex}"
+    workspace_id = default_workspace_id(current_user["id"])
     try:
         return store.create_workspace(user_id=current_user["id"], workspace_id=workspace_id, name=body.name)
     except ValueError as exc:
@@ -1098,6 +1246,33 @@ def read_workspace_file(
     )
 
 
+@app.get("/api/workspaces/{workspace_id}/file-bytes/{file_path:path}")
+def download_workspace_file_bytes(
+    workspace_id: str,
+    file_path: str,
+    version_id: str | None = None,
+    current_user: dict = Depends(get_current_user),
+    object_store: AliyunObjectStore = Depends(require_object_store),
+) -> Response:
+    require_workspace_owner(workspace_id, current_user)
+    result = read_workspace_file_bytes(
+        workspace_id=workspace_id,
+        file_path=file_path,
+        version_id=version_id,
+        object_store=object_store,
+    )
+    data = base64.b64decode(result["content_base64"])
+    safe_name = safe_filename(PurePosixPath(result["file"]["path"]).name or "download")
+    return Response(
+        content=data,
+        media_type=result["file"]["content_type"] or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
 def read_workspace_file_content(
     workspace_id: str,
     file_path: str,
@@ -1143,6 +1318,120 @@ def read_workspace_file_bytes(
         "file": file_record,
         "content_base64": base64.b64encode(data).decode("ascii"),
     }
+
+
+def export_sandbox_references_from_message(
+    *,
+    run_id: str,
+    workspace_id: str,
+    text: str,
+    object_store: AliyunObjectStore,
+) -> list[dict]:
+    matches = list(SANDBOX_EXPORT_PATTERN.finditer(text or ""))
+    if not matches:
+        return []
+    if len(matches) > MAX_SANDBOX_EXPORTS_PER_MESSAGE:
+        matches = matches[:MAX_SANDBOX_EXPORTS_PER_MESSAGE]
+
+    sandbox_root = sandbox_workspace_dir_for_run(run_id).resolve()
+    exported = []
+    for index, match in enumerate(matches, start=1):
+        description = match.group(1).strip()
+        raw_sandbox_path = match.group(2).strip()
+        try:
+            sandbox_path = normalize_sandbox_export_path(raw_sandbox_path)
+            source_path = (sandbox_root / sandbox_path).resolve()
+            if not is_relative_to(source_path, sandbox_root) or not source_path.is_file():
+                raise ValueError("Sandbox file not found")
+            size = source_path.stat().st_size
+            if size > MAX_SANDBOX_EXPORT_BYTES:
+                raise ValueError(f"Sandbox file is too large: {size} bytes")
+            data = source_path.read_bytes()
+            filename = safe_filename(PurePosixPath(sandbox_path).name or f"export-{index}")
+            workspace_path = unique_sandbox_export_workspace_path(run_id, filename, index)
+            content_type = detect_content_type(data, filename, None)
+            blob = object_store.put_bytes(data, content_type=content_type)
+            file_record = store.write_workspace_file(
+                workspace_id=workspace_id,
+                path=workspace_path,
+                blob_key=blob["key"],
+                blob_sha256=blob["sha256"],
+                size=blob["size"],
+                content_type=content_type,
+                message=f"export sandbox {sandbox_path}",
+            )
+            exported.append({
+                "ok": True,
+                "description": description,
+                "sandbox_path": sandbox_path,
+                "workspace_path": file_record["path"],
+                "content_type": file_record["content_type"],
+                "size": file_record["size"],
+                "sha256": blob["sha256"],
+            })
+        except (OSError, ValueError) as exc:
+            exported.append({
+                "ok": False,
+                "description": description,
+                "sandbox_path": raw_sandbox_path,
+                "error": str(exc),
+            })
+    return exported
+
+
+def normalize_sandbox_export_path(value: str) -> str:
+    raw_path = urllib.parse.unquote(value.replace("\\", "/").strip())
+    if raw_path.startswith("/sandbox/"):
+        raw_path = raw_path[len("/sandbox/") :]
+    raw_path = raw_path.strip("/")
+    path = PurePosixPath(raw_path)
+    if "\0" in raw_path or not raw_path or path.is_absolute() or any(part in {"..", ""} for part in path.parts):
+        raise ValueError("Invalid sandbox file path")
+    return path.as_posix()
+
+
+def unique_sandbox_export_workspace_path(run_id: str, filename: str, index: int) -> str:
+    safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id).strip("._") or "run"
+    safe_name = safe_filename(filename or f"export-{index}")
+    if index <= 1:
+        return f"导出文件/{safe_run_id}/{safe_name}"
+    stem, dot, suffix = safe_name.rpartition(".")
+    if dot:
+        return f"导出文件/{safe_run_id}/{stem}-{index}.{suffix}"
+    return f"导出文件/{safe_run_id}/{safe_name}-{index}"
+
+
+def is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def conversation_sandbox_workspace_dir(conversation_id: str) -> Path:
+    safe_conversation_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", conversation_id).strip("._") or "conversation"
+    return settings.worker_sandbox_root_path / safe_conversation_id / "workspace"
+
+
+def sandbox_workspace_dir_for_run(run_id: str) -> Path:
+    run = store.get_run(run_id)
+    conversation_id = str(run.get("conversation_id") or "") if run else ""
+    if not conversation_id:
+        return settings.worker_runs_root_path / run_id / "workspace"
+    return conversation_sandbox_workspace_dir(conversation_id)
+
+
+def resolve_model_provider(app_settings: Settings) -> tuple[str, str]:
+    configured_profile = str(app_settings.openai_provider_profile or "auto").strip().lower()
+    if app_settings.openai_configured:
+        if app_settings.openai_base_url:
+            profile = configured_profile if configured_profile != "auto" else "codex-responses"
+            return "new-api-codex" if profile == "codex-responses" else "openai-relay", profile
+        return "openai", "official"
+    if app_settings.codex_relay_configured:
+        return "codex-relay", "codex-responses"
+    return "openai", "official"
 
 
 @app.put("/api/workspaces/{workspace_id}/files/{file_path:path}")
@@ -1291,7 +1580,10 @@ def list_conversation_messages(
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     require_conversation_owner(conversation_id, current_user)
-    return {"messages": store.list_messages(conversation_id)}
+    return {
+        "messages": store.list_messages(conversation_id),
+        "activeRun": store.get_active_run_for_conversation(conversation_id),
+    }
 
 
 @app.post("/api/conversations/{conversation_id}/runs", response_model=CreateRunResponse)
@@ -1320,11 +1612,15 @@ async def create_run(
     run_id = f"run_{uuid.uuid4().hex}"
     previous_messages = store.list_messages(conversation_id)
     try:
+        agent_credential = ensure_user_agent_credential(current_user)
         seeded_session_item_count = store.ensure_agent_session_seeded_from_messages(conversation_id, previous_messages)
         store.create_run(
             run_id=run_id,
             conversation_id=conversation_id,
+            user_id=current_user["id"],
+            agent_credential_id=agent_credential["id"],
             user_message=message_text,
+            run_settings=run_settings.model_dump(),
             input_payload=input_payload,
             attachments=input_payload["attachments"],
         )
@@ -1340,17 +1636,10 @@ async def create_run(
                 "historyMessageCount": len(previous_messages) + 1,
                 "sessionSeedItemCount": seeded_session_item_count,
                 "attachmentCount": len(attachments),
+                "agentCredentialId": agent_credential["id"],
                 **run_settings.model_dump(),
             },
         },
-    )
-    asyncio.create_task(
-        start_node_worker(
-            run_id=run_id,
-            conversation_id=conversation_id,
-            workspace_id=conversation["workspace_id"],
-            run_settings=run_settings,
-        )
     )
     return CreateRunResponse(
         run_id=run_id,
@@ -1363,6 +1652,22 @@ async def create_run(
 def get_run(run_id: str, current_user: dict = Depends(get_current_user)) -> dict:
     run, _conversation = require_run_owner(run_id, current_user)
     return run
+
+
+@app.get("/api/runs/{run_id}/events/history")
+def list_run_event_history(
+    run_id: str,
+    after: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=5000),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    require_run_owner(run_id, current_user)
+    events = store.list_events(run_id=run_id, after=after, limit=limit)
+    return {
+        "runId": run_id,
+        "events": events,
+        "lastSeq": max((int(event["seq"]) for event in events), default=after),
+    }
 
 
 @app.post("/api/runs/{run_id}/cancel")
@@ -1419,9 +1724,32 @@ def append_worker_event(
         return {"ok": True, "ignored": True, "status": run["status"]}
 
     event_body = body.model_dump(exclude_none=True)
+    assistant_message_payload = None
+    sandbox_exports_event_payload = None
     if body.type == "model.usage":
         context = store.get_context_snapshot(run_id, body.payload.get("callId"))
         event_body["payload"] = enrich_usage_payload(usage_payload_with_context(body.payload, context), settings)
+
+    if body.type == "assistant.message.done":
+        current_run = store.get_run(run_id)
+        text = str(body.payload.get("text") or "")
+        if current_run and text:
+            try:
+                conversation = store.get_conversation(current_run["conversation_id"])
+                if conversation:
+                    exported_files = export_sandbox_references_from_message(
+                        run_id=run_id,
+                        workspace_id=conversation["workspace_id"],
+                        text=text,
+                        object_store=get_object_store(),
+                    )
+                    if exported_files:
+                        assistant_message_payload = {"sandbox_exports": exported_files}
+                        sandbox_exports_event_payload = {"exports": exported_files}
+                        event_body["payload"] = {**event_body["payload"], "sandbox_exports": exported_files}
+            except Exception as exc:
+                assistant_message_payload = {"sandbox_exports_error": str(exc)}
+                event_body["payload"] = {**event_body["payload"], "sandbox_exports_error": str(exc)}
 
     event = store.append_event(run_id, event_body)
 
@@ -1429,13 +1757,22 @@ def append_worker_event(
         store.record_context_estimate(run_id, event_body["payload"])
 
     if body.type == "model.usage":
-        store.record_model_usage(run_id, event_body["payload"], visibility=body.visibility)
+        try:
+            store.record_model_usage(run_id, event_body["payload"], visibility=body.visibility)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     if body.type == "assistant.message.done":
         run = store.get_run(run_id)
         text = str(body.payload.get("text") or "")
         if run and text:
-            store.append_message(run["conversation_id"], "assistant", text, run_id=run_id)
+            if sandbox_exports_event_payload:
+                store.append_event(run_id, {
+                    "type": "sandbox.exports.created",
+                    "visibility": "user",
+                    "payload": sandbox_exports_event_payload,
+                })
+            store.append_message(run["conversation_id"], "assistant", text, run_id=run_id, payload=assistant_message_payload)
 
     if body.type == "run.completed":
         store.set_run_status(run_id, "completed")
@@ -1617,7 +1954,7 @@ def resolve_run_settings(body: CreateRunRequest, app_settings: Settings) -> RunE
     if normalize_model_key(model) not in SUPPORTED_MODELS:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported model. Supported models: gpt-5.4, gpt-5.5",
+            detail="Unsupported model. Supported models: gpt-5.5",
         )
 
     reasoning_effort = body.reasoning_effort or cast_reasoning_effort(app_settings.openai_reasoning_effort)
@@ -1643,6 +1980,49 @@ def cast_reasoning_effort(value: str) -> ReasoningEffort:
     if value in {"low", "medium", "high", "xhigh"}:
         return value  # type: ignore[return-value]
     return "medium"
+
+
+def run_settings_from_record(run: dict) -> RunExecutionSettings:
+    payload = load_json_object(str(run.get("settings_json") or ""))
+    try:
+        return RunExecutionSettings(**payload)
+    except Exception:
+        return RunExecutionSettings(
+            model=str(payload.get("model") or default_worker_model(settings)),
+            reasoning_effort=cast_reasoning_effort(str(payload.get("reasoning_effort") or settings.openai_reasoning_effort)),
+            reasoning_summary=str(payload.get("reasoning_summary") or settings.openai_reasoning_summary),
+            text_verbosity=str(payload.get("text_verbosity") or settings.openai_text_verbosity),
+            speed_mode="fast" if payload.get("speed_mode") != "standard" else "standard",
+            service_tier=str(payload.get("service_tier") or SERVICE_TIER_BY_SPEED_MODE.get("fast", "priority")),
+        )
+
+
+async def run_scheduler_loop() -> None:
+    while True:
+        claimed = store.claim_next_queued_run()
+        if not claimed:
+            await asyncio.sleep(0.5)
+            continue
+        run_settings = run_settings_from_record(claimed)
+        try:
+            await start_node_worker(
+                run_id=claimed["id"],
+                conversation_id=claimed["conversation_id"],
+                workspace_id=claimed["workspace_id"],
+                run_settings=run_settings,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            store.append_event(
+                claimed["id"],
+                {
+                    "type": "run.failed",
+                    "visibility": "user",
+                    "payload": {"error": f"Run scheduler failed: {exc}"},
+                },
+            )
+            store.set_run_status(claimed["id"], "failed")
 
 
 async def store_uploaded_attachment(
@@ -1716,7 +2096,7 @@ def safe_filename(filename: str) -> str:
 
 def attachment_workspace_path(attachment_id: str, safe_name: str) -> str:
     date_part = datetime.now(UTC).strftime("%Y%m%d")
-    return f"attachments/{date_part}/{attachment_id}-{safe_name}"
+    return f"上传文件/{date_part}/{attachment_id}-{safe_name}"
 
 
 def detect_content_type(data: bytes, filename: str, provided: str | None) -> str:
@@ -1806,13 +2186,11 @@ async def start_node_worker(
     run = store.get_run(run_id)
     if not run or run["status"] in TERMINAL_RUN_STATUSES:
         return
-    store.set_run_status(run_id, "running")
     worker_entry = settings.worker_entry_path
-    sandbox_dir = settings.worker_sandbox_root_path / run_id
+    sandbox_dir = conversation_sandbox_workspace_dir(conversation_id)
     run_dir = settings.worker_runs_root_path / run_id
-    run_workspace_dir = run_dir / "workspace"
+    run_workspace_dir = sandbox_dir
     run_artifacts_dir = run_dir / "artifacts"
-    sandbox_dir.mkdir(parents=True, exist_ok=True)
     run_workspace_dir.mkdir(parents=True, exist_ok=True)
     run_artifacts_dir.mkdir(parents=True, exist_ok=True)
     if not worker_entry.exists():
@@ -1827,6 +2205,7 @@ async def start_node_worker(
         store.set_run_status(run_id, "failed")
         return
 
+    provider_label, provider_profile = resolve_model_provider(settings)
     env = os.environ.copy()
     env.update(
         {
@@ -1846,13 +2225,19 @@ async def start_node_worker(
             "WORKER_DOCKER_MEMORY": settings.worker_docker_memory,
             "WORKER_DOCKER_PIDS_LIMIT": settings.worker_docker_pids_limit,
             "WORKER_KEEP_CONTAINER": str(settings.worker_keep_container).lower(),
+            "WORKER_RUNTIME_TOOL_MODE": settings.worker_runtime_tool_mode,
             "OPENAI_MODEL": run_settings.model,
+            "OPENAI_COMPACTION_ENABLED": str(settings.openai_compaction_enabled).lower(),
+            "OPENAI_API_PROTOCOL": settings.openai_api_protocol,
+            "OPENAI_PROVIDER_PROFILE": provider_profile,
+            "OPENAI_RESPONSES_RELAY_MODE": settings.openai_responses_relay_mode,
             "OPENAI_REASONING_EFFORT": run_settings.reasoning_effort,
             "OPENAI_REASONING_SUMMARY": run_settings.reasoning_summary,
             "OPENAI_TEXT_VERBOSITY": run_settings.text_verbosity,
             "OPENAI_SERVICE_TIER": run_settings.service_tier,
+            "OPENAI_SEND_SERVICE_TIER": settings.openai_send_service_tier,
             "OPENAI_SPEED_MODE": run_settings.speed_mode,
-            "OPENAI_MODEL_PROVIDER": "openai",
+            "OPENAI_MODEL_PROVIDER": provider_label,
             "OPENAI_AGENTS_DISABLE_TRACING": "1",
         }
     )
@@ -1860,11 +2245,9 @@ async def start_node_worker(
         env["OPENAI_API_KEY"] = settings.openai_api_key
         if settings.openai_base_url:
             env["OPENAI_BASE_URL"] = settings.openai_base_url
-            env["OPENAI_MODEL_PROVIDER"] = "openai-compatible"
     elif settings.codex_relay_configured:
         env["OPENAI_API_KEY"] = settings.codex_relay_api_key
         env["OPENAI_BASE_URL"] = f"{settings.api_base_url.rstrip('/')}/codex-relay/v1"
-        env["OPENAI_MODEL_PROVIDER"] = "codex-relay"
 
     node_executable = shutil.which("node")
     if not node_executable:
@@ -1904,7 +2287,7 @@ async def start_node_worker(
         return
 
     run = store.get_run(run_id)
-    if run and run["status"] == "cancelled":
+    if run and run["status"] in TERMINAL_RUN_STATUSES:
         return
 
     if code != 0:

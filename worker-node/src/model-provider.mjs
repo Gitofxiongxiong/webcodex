@@ -2,19 +2,25 @@ import { encodingForModel, getEncoding } from "js-tiktoken";
 
 import { event, postEvent } from "./protocol.mjs";
 
-export function createModelProvider({ provider, debugModelRequests = false }) {
-  return new RequestInspectingModelProvider({ provider, debugModelRequests });
+export function createModelProvider({ provider, debugModelRequests = false, synthesizeEmptyResponseOutput = false }) {
+  return new RequestInspectingModelProvider({ provider, debugModelRequests, synthesizeEmptyResponseOutput });
 }
 
 class RequestInspectingModelProvider {
-  constructor({ provider, debugModelRequests }) {
+  constructor({ provider, debugModelRequests, synthesizeEmptyResponseOutput }) {
     this.provider = provider;
     this.debugModelRequests = debugModelRequests;
+    this.synthesizeEmptyResponseOutput = Boolean(synthesizeEmptyResponseOutput);
   }
 
   async getModel(modelName) {
     const model = await this.provider.getModel(modelName);
-    return new RequestInspectingModel({ model, modelName, debugModelRequests: this.debugModelRequests });
+    return new RequestInspectingModel({
+      model,
+      modelName,
+      debugModelRequests: this.debugModelRequests,
+      synthesizeEmptyResponseOutput: this.synthesizeEmptyResponseOutput,
+    });
   }
 
   async close() {
@@ -25,16 +31,19 @@ class RequestInspectingModelProvider {
 }
 
 class RequestInspectingModel {
-  constructor({ model, modelName, debugModelRequests }) {
+  constructor({ model, modelName, debugModelRequests, synthesizeEmptyResponseOutput }) {
     this.model = model;
     this.modelName = modelName;
     this.debugModelRequests = debugModelRequests;
+    this.synthesizeEmptyResponseOutput = Boolean(synthesizeEmptyResponseOutput);
     this.callIndex = 0;
   }
 
   async getResponse(request) {
     const call = await this.beforeCall("response", request);
-    const response = await this.model.getResponse(request);
+    const response = this.synthesizeEmptyResponseOutput
+      ? synthesizeResponseOutputFromProviderData(await this.model.getResponse(request), call)
+      : await this.model.getResponse(request);
     await this.postUsageFromModelResponse(call, request, response);
     return response;
   }
@@ -45,11 +54,13 @@ class RequestInspectingModel {
 
   async *streamWithUsage(request) {
     const call = await this.beforeCall("stream", request);
+    const outputSynthesizer = this.synthesizeEmptyResponseOutput ? new StreamOutputSynthesizer(call) : null;
     for await (const streamEvent of this.model.getStreamedResponse(request)) {
-      if (streamEvent?.type === "response_done") {
-        await this.postUsageFromStreamResponse(call, request, streamEvent.response);
+      const outgoingEvent = outputSynthesizer ? outputSynthesizer.rewrite(streamEvent) : streamEvent;
+      if (outgoingEvent?.type === "response_done") {
+        await this.postUsageFromStreamResponse(call, request, outgoingEvent.response);
       }
-      yield streamEvent;
+      yield outgoingEvent;
     }
   }
 
@@ -112,6 +123,337 @@ class RequestInspectingModel {
   }
 }
 
+class StreamOutputSynthesizer {
+  constructor(call) {
+    this.call = call;
+    this.outputText = "";
+    this.outputItems = [];
+    this.outputItemKeys = new Map();
+    this.partialFunctionCalls = new Map();
+    this.outputSequence = 0;
+  }
+
+  rewrite(streamEvent) {
+    this.recordStreamEvent(streamEvent);
+    if (streamEvent?.type === "output_text_delta" && typeof streamEvent.delta === "string") {
+      this.outputText += streamEvent.delta;
+      return streamEvent;
+    }
+    if (streamEvent?.type !== "response_done") {
+      return streamEvent;
+    }
+    return synthesizeResponseOutputFromStreamItems(streamEvent, this.outputItems, this.outputText, this.call);
+  }
+
+  recordStreamEvent(streamEvent) {
+    if (streamEvent?.type !== "model" || !isRecord(streamEvent.event)) {
+      return;
+    }
+    const rawEvent = streamEvent.event;
+    if (rawEvent.type === "response.output_item.added" && isRecord(rawEvent.item)) {
+      this.recordPartialFunctionCall(rawEvent.item);
+      return;
+    }
+    if (rawEvent.type === "response.output_item.done" && isRecord(rawEvent.item)) {
+      this.upsertOutputItem(rawEvent.item, numeric(rawEvent.output_index));
+      return;
+    }
+    if (rawEvent.type === "response.function_call_arguments.done") {
+      const callId = stringValue(rawEvent.call_id);
+      const partial = callId ? this.partialFunctionCalls.get(callId) : null;
+      const name = stringValue(rawEvent.name) || stringValue(partial?.name);
+      if (!callId || !name) {
+        return;
+      }
+      this.upsertOutputItem(
+        {
+          id: stringValue(rawEvent.item_id) || stringValue(partial?.id) || `fc_${callId}`,
+          type: "function_call",
+          status: "completed",
+          call_id: callId,
+          name,
+          ...(typeof partial?.namespace === "string" ? { namespace: partial.namespace } : {}),
+          arguments: typeof rawEvent.arguments === "string" ? rawEvent.arguments : "",
+        },
+        numeric(rawEvent.output_index)
+      );
+    }
+  }
+
+  recordPartialFunctionCall(rawItem) {
+    if (rawItem?.type !== "function_call") {
+      return;
+    }
+    const callId = stringValue(rawItem.call_id);
+    if (!callId) {
+      return;
+    }
+    this.partialFunctionCalls.set(callId, {
+      id: stringValue(rawItem.id),
+      call_id: callId,
+      name: stringValue(rawItem.name),
+      namespace: typeof rawItem.namespace === "string" ? rawItem.namespace : undefined,
+    });
+  }
+
+  upsertOutputItem(rawItem, outputIndex) {
+    const output = modelOutputFromRawResponseItem(rawItem);
+    if (!output) {
+      return;
+    }
+    const key = output.callId ?? output.id ?? `${output.type}_${this.outputSequence}`;
+    const existingIndex = this.outputItemKeys.get(key);
+    const entry = {
+      index: Number.isFinite(outputIndex) ? outputIndex : Number.MAX_SAFE_INTEGER,
+      sequence: this.outputSequence++,
+      output,
+    };
+    if (existingIndex === undefined) {
+      this.outputItemKeys.set(key, this.outputItems.length);
+      this.outputItems.push(entry);
+      return;
+    }
+    const existing = this.outputItems[existingIndex];
+    this.outputItems[existingIndex] = {
+      ...entry,
+      sequence: existing?.sequence ?? entry.sequence,
+      output: mergeModelOutput(existing?.output, output),
+    };
+  }
+}
+
+function synthesizeResponseOutputFromProviderData(response, call) {
+  if (hasModelOutput(response)) {
+    return response;
+  }
+  const providerText = providerOutputText(response?.providerData);
+  if (!providerText) {
+    return response;
+  }
+  return {
+    ...response,
+    output: [assistantMessageOutput(providerText, call)],
+    providerData: {
+      ...(response?.providerData ?? {}),
+      synthesized_output_from_text: true,
+    },
+  };
+}
+
+function synthesizeResponseOutputFromText(streamEvent, outputText, call) {
+  if (hasModelOutput(streamEvent?.response)) {
+    return streamEvent;
+  }
+  const text = outputText || providerOutputText(streamEvent?.response?.providerData);
+  if (!text) {
+    return streamEvent;
+  }
+  return {
+    ...streamEvent,
+    response: {
+      ...streamEvent.response,
+      output: [assistantMessageOutput(text, call)],
+      providerData: {
+        ...(streamEvent.response?.providerData ?? {}),
+        synthesized_output_from_text: true,
+      },
+    },
+  };
+}
+
+function synthesizeResponseOutputFromStreamItems(streamEvent, collectedItems, outputText, call) {
+  const output = collectedItems
+    .slice()
+    .sort((left, right) => left.index - right.index || left.sequence - right.sequence)
+    .map((entry) => entry.output);
+  if (hasModelOutput(streamEvent?.response)) {
+    const mergedOutput = mergeResponseOutputItems(streamEvent.response.output, output);
+    if (mergedOutput.length === streamEvent.response.output.length) {
+      return streamEvent;
+    }
+    return {
+      ...streamEvent,
+      response: {
+        ...streamEvent.response,
+        output: mergedOutput,
+        providerData: {
+          ...(streamEvent.response.providerData ?? {}),
+          synthesized_output_from_stream_items: true,
+        },
+      },
+    };
+  }
+  if (output.length === 0) {
+    return synthesizeResponseOutputFromText(streamEvent, outputText, call);
+  }
+  return {
+    ...streamEvent,
+    response: {
+      ...streamEvent.response,
+      output,
+      providerData: {
+        ...(streamEvent.response?.providerData ?? {}),
+        synthesized_output_from_stream_items: true,
+      },
+    },
+  };
+}
+
+function mergeResponseOutputItems(existingOutput, collectedOutput) {
+  const merged = Array.isArray(existingOutput) ? [...existingOutput] : [];
+  const existingKeys = new Set(merged.map(outputItemKey).filter(Boolean));
+  for (const item of collectedOutput) {
+    const key = outputItemKey(item);
+    if (key && existingKeys.has(key)) {
+      continue;
+    }
+    merged.push(item);
+    if (key) {
+      existingKeys.add(key);
+    }
+  }
+  return merged;
+}
+
+function outputItemKey(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+  const type = typeof item.type === "string" ? item.type : "item";
+  const callId = stringValue(item.callId ?? item.call_id);
+  if (callId) {
+    return `${type}:call:${callId}`;
+  }
+  const id = stringValue(item.id);
+  return id ? `${type}:id:${id}` : "";
+}
+
+function assistantMessageOutput(text, call) {
+  return {
+    id: `msg_${call.callId}`,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text }],
+  };
+}
+
+function modelOutputFromRawResponseItem(item) {
+  if (!isRecord(item) || typeof item.type !== "string") {
+    return null;
+  }
+  if (item.type === "message") {
+    return messageOutputFromRawResponseItem(item);
+  }
+  if (item.type === "function_call") {
+    const callId = stringValue(item.call_id);
+    const name = stringValue(item.name);
+    if (!callId || !name) {
+      return null;
+    }
+    return {
+      id: stringValue(item.id) || undefined,
+      type: "function_call",
+      callId,
+      name,
+      ...(typeof item.namespace === "string" ? { namespace: item.namespace } : {}),
+      status: stringValue(item.status) || "completed",
+      arguments: typeof item.arguments === "string" ? item.arguments : "",
+      providerData: providerDataWithout(item, ["id", "type", "call_id", "name", "namespace", "status", "arguments"]),
+    };
+  }
+  if (item.type === "reasoning") {
+    return {
+      id: stringValue(item.id) || undefined,
+      type: "reasoning",
+      content: arrayOrEmpty(item.summary).map((content) => ({
+        type: "input_text",
+        text: stringValue(content?.text),
+        providerData: providerDataWithout(content, ["text"]),
+      })),
+      providerData: providerDataWithout(item, ["id", "type", "summary"]),
+    };
+  }
+  if (item.type === "shell_call") {
+    return {
+      id: stringValue(item.id) || undefined,
+      type: "shell_call",
+      callId: stringValue(item.call_id),
+      status: stringValue(item.status) || "in_progress",
+      action: {
+        commands: arrayOrEmpty(item.action?.commands).map(String),
+        ...(typeof item.action?.timeout_ms === "number" ? { timeoutMs: item.action.timeout_ms } : {}),
+        ...(typeof item.action?.max_output_length === "number" ? { maxOutputLength: item.action.max_output_length } : {}),
+      },
+      providerData: providerDataWithout(item, ["id", "type", "call_id", "status", "action"]),
+    };
+  }
+  if (item.type === "apply_patch_call") {
+    return {
+      id: stringValue(item.id) || undefined,
+      type: "apply_patch_call",
+      callId: stringValue(item.call_id),
+      status: stringValue(item.status) || "in_progress",
+      operation: item.operation,
+      providerData: providerDataWithout(item, ["id", "type", "call_id", "status", "operation"]),
+    };
+  }
+  return null;
+}
+
+function messageOutputFromRawResponseItem(item) {
+  const content = arrayOrEmpty(item.content)
+    .map((part) => {
+      if (part?.type === "output_text") {
+        return {
+          type: "output_text",
+          text: stringValue(part.text),
+          providerData: providerDataWithout(part, ["type", "text"]),
+        };
+      }
+      if (part?.type === "refusal") {
+        return {
+          type: "refusal",
+          refusal: stringValue(part.refusal),
+          providerData: providerDataWithout(part, ["type", "refusal"]),
+        };
+      }
+      return null;
+    })
+    .filter(Boolean);
+  if (content.length === 0) {
+    return null;
+  }
+  return {
+    id: stringValue(item.id) || undefined,
+    type: "message",
+    role: stringValue(item.role) || "assistant",
+    status: stringValue(item.status) || "completed",
+    content,
+    providerData: providerDataWithout(item, ["id", "type", "role", "status", "content"]),
+  };
+}
+
+function mergeModelOutput(existing, next) {
+  if (!existing || existing.type !== "function_call" || next?.type !== "function_call") {
+    return next;
+  }
+  return {
+    ...existing,
+    ...next,
+    arguments: next.arguments || existing.arguments || "",
+  };
+}
+
+function hasModelOutput(response) {
+  return Array.isArray(response?.output) && response.output.length > 0;
+}
+
+function providerOutputText(providerData) {
+  const value = providerData?.output_text ?? providerData?.text;
+  return typeof value === "string" && value ? value : "";
+}
+
 function summarizeRequest(request) {
   const input = Array.isArray(request.input) ? request.input : [{ type: "text" }];
   return {
@@ -165,6 +507,7 @@ function estimateContextPayload({ call, request }) {
 
 function usagePayload({ call, request, usage, response }) {
   const model = call.model ?? response?.providerData?.model ?? "unknown";
+  const requestUsageEntry = firstRequestUsageEntry(response?.usage);
   const contextWindow = contextWindowForModel(model);
   const reservedOutputTokens = reservedOutputTokensForModel(model);
   const usableContextTokens = Math.max(contextWindow - reservedOutputTokens, 1);
@@ -183,7 +526,8 @@ function usagePayload({ call, request, usage, response }) {
     usableContextTokens,
     remainingTokens: Math.max(usableContextTokens - inputTokens, 0),
     usedPercent: clampPercent((inputTokens / usableContextTokens) * 100),
-    source: "provider-usage",
+    endpoint: requestUsageEntry?.endpoint ?? null,
+    source: requestUsageEntry?.endpoint === "responses.compact" ? "responses.compact" : "provider-usage",
     usage,
   };
 }
@@ -396,11 +740,12 @@ function normalizeUsage(usage) {
       totalTokens: 0,
     };
   }
-  const inputTokens = numeric(usage.inputTokens ?? usage.input_tokens);
-  const outputTokens = numeric(usage.outputTokens ?? usage.output_tokens);
-  const totalTokens = numeric(usage.totalTokens ?? usage.total_tokens ?? inputTokens + outputTokens);
-  const inputDetails = usage.inputTokensDetails ?? usage.input_tokens_details ?? {};
-  const outputDetails = usage.outputTokensDetails ?? usage.output_tokens_details ?? {};
+  const requestUsageEntry = firstRequestUsageEntry(usage);
+  const inputTokens = numeric(requestUsageEntry?.inputTokens ?? requestUsageEntry?.input_tokens ?? usage.inputTokens ?? usage.input_tokens);
+  const outputTokens = numeric(requestUsageEntry?.outputTokens ?? requestUsageEntry?.output_tokens ?? usage.outputTokens ?? usage.output_tokens);
+  const totalTokens = numeric(requestUsageEntry?.totalTokens ?? requestUsageEntry?.total_tokens ?? usage.totalTokens ?? usage.total_tokens ?? inputTokens + outputTokens);
+  const inputDetails = requestUsageEntry?.inputTokensDetails ?? requestUsageEntry?.input_tokens_details ?? usage.inputTokensDetails ?? usage.input_tokens_details ?? {};
+  const outputDetails = requestUsageEntry?.outputTokensDetails ?? requestUsageEntry?.output_tokens_details ?? usage.outputTokensDetails ?? usage.output_tokens_details ?? {};
   return {
     inputTokens,
     cachedTokens: numeric(inputDetails.cachedTokens ?? inputDetails.cached_tokens),
@@ -412,6 +757,11 @@ function normalizeUsage(usage) {
   };
 }
 
+function firstRequestUsageEntry(usage) {
+  const entries = usage?.requestUsageEntries ?? usage?.request_usage_entries;
+  return Array.isArray(entries) && entries.length > 0 ? entries[0] : null;
+}
+
 function hasAnyUsage(usage) {
   return usage.inputTokens > 0 || usage.outputTokens > 0 || usage.totalTokens > 0;
 }
@@ -419,6 +769,26 @@ function hasAnyUsage(usage) {
 function numeric(value) {
   const number = Number(value ?? 0);
   return Number.isFinite(number) ? number : 0;
+}
+
+function stringValue(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function arrayOrEmpty(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function providerDataWithout(source, keys) {
+  if (!isRecord(source)) {
+    return {};
+  }
+  const ignored = new Set(keys);
+  return Object.fromEntries(Object.entries(source).filter(([key]) => !ignored.has(key)));
 }
 
 function sumBreakdownTokens(breakdown) {

@@ -100,11 +100,15 @@ export class SdkEventNormalizer {
     }
 
     if (data.type === "response.reasoning_summary_text.done") {
+      const text = typeof data.text === "string" ? data.text : "";
+      if (!text.trim()) {
+        return [];
+      }
       return [
         event(
           "assistant.reasoning_summary.done",
           {
-            text: data.text ?? "",
+            text,
             source: "openai-agents",
           },
           { itemId: itemIdFor(data.item_id ?? "reasoning_1", "reasoning"), status: "completed" }
@@ -216,15 +220,16 @@ export class SdkEventNormalizer {
 
     if (sdkEvent.name === "reasoning_item_created") {
       const text = reasoningSummaryText(sdkEvent.item);
-      const payload = text ? { text, source: "openai-agents" } : { itemType: item.type };
+      if (!text) {
+        return [];
+      }
       return [
         event(
           "assistant.reasoning_summary.done",
-          payload,
+          { text, source: "openai-agents" },
           {
             itemId: itemIdFor(item.rawItem?.id ?? "reasoning_1", "reasoning"),
             status: "completed",
-            visibility: text ? "user" : "debug",
           }
         ),
       ];
@@ -278,6 +283,10 @@ export class SdkEventNormalizer {
         "codex.command.started",
         {
           name: "shell",
+          displayName: "bash (/sandbox)",
+          toolProtocol: "openai.shell",
+          executor: "bash",
+          runtime: "docker",
           callId,
           command: shellCommandText(action),
           cwd: "/sandbox",
@@ -298,6 +307,41 @@ export class SdkEventNormalizer {
           operation: toJsonSafe(operation),
           path: operation?.path,
           type: operation?.type,
+          source: "openai-agents",
+        },
+        { itemId: itemIdFor(callId, "patch"), status: "running" }
+      );
+    }
+
+    if (name === "shell" && Array.isArray(args?.commands)) {
+      return event(
+        "codex.command.started",
+        {
+          name: "shell",
+          displayName: "bash (/sandbox)",
+          toolProtocol: "function.shell",
+          executor: "bash",
+          runtime: "docker",
+          callId,
+          command: shellCommandText(args),
+          cwd: "/sandbox",
+          action: toJsonSafe(args),
+          source: "openai-agents",
+        },
+        { itemId: itemIdFor(callId, "command"), status: "running" }
+      );
+    }
+
+    if (name === "apply_patch" && args?.type) {
+      return event(
+        "codex.patch.started",
+        {
+          name: "apply_patch",
+          toolProtocol: "function.apply_patch",
+          callId,
+          operation: toJsonSafe(args),
+          path: args?.path,
+          type: args?.type,
           source: "openai-agents",
         },
         { itemId: itemIdFor(callId, "patch"), status: "running" }
@@ -328,6 +372,10 @@ export class SdkEventNormalizer {
         "codex.command.completed",
         {
           name: "shell",
+          displayName: "bash (/sandbox)",
+          toolProtocol: raw.type === "shell_call_output" ? "openai.shell" : "function.shell",
+          executor: "bash",
+          runtime: "docker",
           callId,
           ...summary,
           output: toJsonSafe(output),
@@ -370,24 +418,6 @@ export class SdkEventNormalizer {
       }
     }
 
-    if (remembered?.name === "viewTool2") {
-      const parsed = parseJsonMaybe(output);
-      const payload = typeof parsed === "string" ? parseJsonMaybe(parsed) : parsed;
-      if (payload?.mode === "image" || payload?.mode === "pdf") {
-        return event(
-          "artifact.preview",
-          {
-            name: "viewTool2",
-            callId,
-            preview: toJsonSafe(payload),
-            output: toJsonSafe(payload),
-            source: "openai-agents",
-          },
-          { itemId: itemIdFor(callId, "artifact"), status: "completed" }
-        );
-      }
-    }
-
     return event(
       "tool.call.completed",
       {
@@ -407,18 +437,49 @@ function shellCommandText(action) {
 }
 
 function shellOutputSummary(output) {
-  const rows = Array.isArray(output) ? output : [];
+  const normalized = normalizeShellOutput(output);
+  const rows = normalized.rows;
   const last = rows.at(-1) ?? {};
   const exitCode = last.outcome?.type === "exit" ? last.outcome.exitCode : null;
   const timedOut = rows.some((row) => row?.outcome?.type === "timeout");
+  const stdout = rows.map((row) => row?.stdout ?? "").filter(Boolean).join("\n");
+  const stderr = [
+    rows.map((row) => row?.stderr ?? "").filter(Boolean).join("\n"),
+    normalized.error,
+  ].filter(Boolean).join("\n");
   return {
-    ok: !timedOut && rows.every((row) => row?.outcome?.type === "exit" && row.outcome.exitCode === 0),
+    ok: !normalized.error && !timedOut && rows.every((row) => row?.outcome?.type === "exit" && row.outcome.exitCode === 0),
     exitCode,
     timedOut,
     durationMs: numeric(last.duration_ms),
-    stdout: rows.map((row) => row?.stdout ?? "").filter(Boolean).join("\n"),
-    stderr: rows.map((row) => row?.stderr ?? "").filter(Boolean).join("\n"),
+    stdout,
+    stderr,
   };
+}
+
+function normalizeShellOutput(output) {
+  const parsed = parseJsonMaybe(output);
+  if (Array.isArray(parsed)) {
+    return { rows: parsed, error: null };
+  }
+  if (Array.isArray(parsed?.output)) {
+    return { rows: parsed.output, error: parsed.ok === false ? parsed.error ?? "Tool execution failed" : null };
+  }
+  if (parsed?.output) {
+    return normalizeShellOutput(parsed.output);
+  }
+  if (parsed && typeof parsed === "object") {
+    if ("stdout" in parsed || "stderr" in parsed || "outcome" in parsed) {
+      return { rows: [parsed], error: null };
+    }
+    if (parsed.ok === false || parsed.error) {
+      return { rows: [], error: parsed.error ?? "Tool execution failed" };
+    }
+  }
+  if (typeof parsed === "string" && parsed.trim()) {
+    return { rows: [], error: parsed };
+  }
+  return { rows: [], error: null };
 }
 
 export function itemIdFor(value, fallbackPrefix) {
